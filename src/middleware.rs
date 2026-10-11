@@ -142,6 +142,25 @@ impl Waf {
         }
     }
 
+    /// 面板保存入口：覆盖配置——先写配置文件（存在路径时），再立即生效（规则重编译、限速计数清零）。
+    ///
+    /// 写文件失败时不应用（避免“内存已改、重启丢失”的不一致）。
+    pub fn apply_config(&self, cfg: WafConfig) -> Result<(), String> {
+        if let Some(file) = &self.file {
+            cfg.save(file)?;
+        }
+        match self.config.write() {
+            Ok(mut w) => *w = cfg,
+            Err(p) => *p.into_inner() = cfg,
+        }
+        self.recompile();
+        self.limiter.clear();
+        if let Some(file) = &self.file {
+            self.stamp_mtime(file);
+        }
+        Ok(())
+    }
+
     /// 手动重载配置与规则（校验失败保留旧配置）。
     pub fn reload(&self) {
         let Some(file) = self.file.clone() else {
@@ -161,16 +180,21 @@ impl Waf {
                 }
                 self.recompile();
                 self.limiter.clear();
-                if let Ok(meta) = std::fs::metadata(&file)
-                    && let Ok(t) = meta.modified()
-                    && let Ok(d) = t.duration_since(std::time::UNIX_EPOCH)
-                {
-                    self.last_mtime.store(d.as_millis() as u64, Ordering::Relaxed);
-                }
+                self.stamp_mtime(&file);
             }
             Err(e) => {
                 dhrust::logs::log().warn(&format!("[WAF] 配置热重载失败（保留旧配置）：{e}"));
             }
+        }
+    }
+
+    /// 记录配置文件 mtime 基线（避免下一轮热重载对同内容重复处理）。
+    fn stamp_mtime(&self, file: &Path) {
+        if let Ok(meta) = std::fs::metadata(file)
+            && let Ok(t) = meta.modified()
+            && let Ok(d) = t.duration_since(std::time::UNIX_EPOCH)
+        {
+            self.last_mtime.store(d.as_millis() as u64, Ordering::Relaxed);
         }
     }
 
@@ -231,6 +255,17 @@ impl Waf {
     /// 对原始 HTTP 请求执行检查（中间件入口）。
     pub fn check_http(&self, req: &dhrust::net::http::HttpRequest) -> Verdict {
         let wreq = WafRequest::from_http(req);
+        // CSRF/跨站来源校验先于回环豁免：浏览器跨站请求的源 IP 恰是回环（localhost/面板免登录场景防护）。
+        // 无 Sec-Fetch-Site 与 Origin 的请求（curl / 服务间调用 / 旧客户端）不进此分支。
+        if let Some(reason) = csrf_check(req) {
+            let cfg = match self.config.read() {
+                Ok(c) => c,
+                Err(p) => p.into_inner(),
+            };
+            if cfg.enable && cfg.csrf_guard {
+                return self.blocked(&cfg, 403, reason, &wreq);
+            }
+        }
         self.check(&wreq)
     }
 
@@ -275,10 +310,14 @@ impl Waf {
             && cfg.extra_allow_bots.iter().any(|k| ua_lower.contains(&k.to_ascii_lowercase()));
         let sensitive = !cfg.sensitive_prefixes.is_empty()
             && cfg.sensitive_prefixes.iter().any(|p| req.path.starts_with(p.as_str()));
+        // 跳过机器人拦截的路径前缀（机器对机器 API；攻击检测/CC 不受影响）
+        let skip_bot = !cfg.skip_bot_prefixes.is_empty()
+            && cfg.skip_bot_prefixes.iter().any(|p| req.path.starts_with(p.as_str()));
 
         // —— 爬虫分类 ——
         let mut friendly_bot = false;
         if !extra_allowed
+            && !skip_bot
             && let Some(kind) = bots::classify(&req.user_agent)
         {
             match kind {
@@ -490,6 +529,44 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// 跨站来源校验（CSRF）：返回拦截原因（None = 放行）。
+///
+/// 判定顺序（仅非安全方法）：
+/// 1. `Sec-Fetch-Site: cross-site` → 拒绝（现代浏览器）；
+/// 2. 无 Sec-Fetch-Site 但有 `Origin`：与请求 `Host` 同源才放行（`null` 视作跨站拒绝）；
+/// 3. 两类头均无（curl / .NET HttpClient / 服务间调用）→ 放行。
+fn csrf_check(req: &dhrust::net::http::HttpRequest) -> Option<String> {
+    let m = req.method.to_ascii_uppercase();
+    if !matches!(m.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
+        return None;
+    }
+    let site = req
+        .header("sec-fetch-site")
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if !site.is_empty() {
+        return if site == "cross-site" {
+            Some("跨站请求（Sec-Fetch-Site: cross-site）".to_string())
+        } else {
+            None
+        };
+    }
+    let origin = req.header("origin").unwrap_or("").trim();
+    if origin.is_empty() {
+        return None;
+    }
+    if origin == "null" {
+        return Some("跨站来源（Origin: null——file:// 或沙盒页面）".to_string());
+    }
+    let host = req.header("host").unwrap_or("").trim();
+    let origin_host = origin.split("://").nth(1).unwrap_or(origin);
+    if !host.is_empty() && !origin_host.eq_ignore_ascii_case(host) {
+        return Some(format!("跨站来源（Origin: {origin} ≠ Host: {host}）"));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,6 +581,65 @@ mod tests {
             content_type: String::new(),
             body_text: String::new(),
         }
+    }
+
+    /// 构造原始 HTTP 请求（CSRF 用例）。
+    fn hreq(method: &str, headers: Vec<(&str, &str)>) -> dhrust::net::http::HttpRequest {
+        dhrust::net::http::HttpRequest {
+            method: method.to_string(),
+            path: "/api/action".to_string(),
+            query: String::new(),
+            headers: headers
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: bytes::Bytes::new(),
+            remote_addr: Some("127.0.0.1:5000".to_string()),
+        }
+    }
+
+    #[test]
+    fn csrf_guard_blocks_cross_site_writes() {
+        let waf = Waf::new(WafConfig::admin_api());
+        // 跨站 POST（哪怕源 IP 是回环——先于回环豁免）→ 403
+        let v = waf.check_http(&hreq(
+            "POST",
+            vec![("Sec-Fetch-Site", "cross-site"), ("Host", "127.0.0.1:5501")],
+        ));
+        assert_eq!(v.blocked_status(), Some(403));
+        // 跨源 Origin → 403
+        let v = waf.check_http(&hreq(
+            "POST",
+            vec![("Origin", "https://evil.example"), ("Host", "127.0.0.1:5501")],
+        ));
+        assert_eq!(v.blocked_status(), Some(403));
+        // Origin: null（file:// / 沙盒）→ 403
+        let v = waf.check_http(&hreq(
+            "POST",
+            vec![("Origin", "null"), ("Host", "127.0.0.1:5501")],
+        ));
+        assert_eq!(v.blocked_status(), Some(403));
+        // 同源 Origin → 放行
+        let v = waf.check_http(&hreq(
+            "POST",
+            vec![
+                ("Origin", "http://127.0.0.1:5501"),
+                ("Host", "127.0.0.1:5501"),
+            ],
+        ));
+        assert!(v.is_allow());
+        // 无来源头（curl / .NET HttpClient / 服务间）→ 放行
+        let v = waf.check_http(&hreq("POST", vec![]));
+        assert!(v.is_allow());
+        // GET 跨站 → 无副作用，放行
+        let v = waf.check_http(&hreq("GET", vec![("Sec-Fetch-Site", "cross-site")]));
+        assert!(v.is_allow());
+        // 关闭 csrf_guard → 放行
+        let mut cfg = WafConfig::admin_api();
+        cfg.csrf_guard = false;
+        let waf2 = Waf::new(cfg);
+        let v = waf2.check_http(&hreq("POST", vec![("Sec-Fetch-Site", "cross-site")]));
+        assert!(v.is_allow());
     }
 
     #[test]
@@ -664,6 +800,34 @@ mod tests {
     }
 
     #[test]
+    fn apply_config_takes_effect_and_persists() {
+        let dir = std::env::temp_dir().join(format!("pek-waf-apply-{}", std::process::id()));
+        let file = dir.join("Config").join("Waf.json");
+        let waf = Waf::load_with_default(&dir, WafConfig::public_site());
+        // 关闭 → 恶意 UA 也放行
+        let mut cfg = waf.config();
+        cfg.enable = false;
+        waf.apply_config(cfg).unwrap();
+        let mut r = wreq("/");
+        r.user_agent = "sqlmap/1.7".into();
+        assert!(waf.check(&r).is_allow(), "关闭后应全放行");
+        // 已持久化到文件
+        let reloaded = WafConfig::load_or_create(&file).unwrap();
+        assert!(!reloaded.enable);
+        // 重新开启 + 下调限速 → 生效
+        let mut cfg = waf.config();
+        cfg.enable = true;
+        cfg.rate_limit_per_min = 2;
+        waf.apply_config(cfg).unwrap();
+        assert_eq!(waf.check(&r).blocked_status(), Some(403), "恢复后恶意 UA 拦截");
+        let s = wreq("/x");
+        assert!(waf.check(&s).is_allow());
+        assert!(waf.check(&s).is_allow());
+        assert_eq!(waf.check(&s).blocked_status(), Some(429));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn reload_recreates_missing_file_with_current_preset() {
         let dir = std::env::temp_dir().join(format!("pek-waf-reload-{}", std::process::id()));
         let file = dir.join("Config").join("Waf.json");
@@ -678,6 +842,24 @@ mod tests {
             "重建应保持前台预设而非库默认（admin_api）"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skip_bot_prefixes_for_machine_api() {
+        let mut cfg = WafConfig::admin_api();
+        cfg.skip_bot_prefixes = vec!["/api".to_string()];
+        let waf = Waf::new(cfg);
+        // skip 前缀下：恶意默认 UA（自家工具）不拦
+        let mut r = wreq("/api/getAvailableSn");
+        r.user_agent = "python-requests/2.31".into();
+        assert!(waf.check(&r).is_allow(), "skip 前缀不拦 bot");
+        // 攻击检测仍生效（skipAttackPrefixes 未设：路径探测照拦）
+        let r2 = wreq("/api/x.php");
+        assert_eq!(waf.check(&r2).blocked_status(), Some(403));
+        // 其余路径仍拦
+        let mut r3 = wreq("/");
+        r3.user_agent = "python-requests/2.31".into();
+        assert_eq!(waf.check(&r3).blocked_status(), Some(403));
     }
 
     #[test]

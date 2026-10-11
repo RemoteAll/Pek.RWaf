@@ -61,7 +61,13 @@ pub struct WafConfig {
     pub sensitive_prefixes: Vec<String>,
     /// 跳过攻击特征检测的路径前缀（本体即“执行 SQL / 传文件”的管理端点；
     /// 这些端点的安全由业务层护栏（只读 SQL 校验、权限、审计）负责；bot/IP/CC 检查不受影响）
-    pub skip_attack_prefixes: Vec<String>,
+    pub skip_attack_prefixes: Vec<String>,    /// 跳过机器人拦截的路径前缀（机器对机器 API——如产测工具调用接口；
+    /// 攻击检测/IP 名单/CC 限速不受影响）
+    pub skip_bot_prefixes: Vec<String>,
+    /// 跨站来源校验（CSRF 防护）：浏览器发起的**非安全方法**请求（POST/PUT/PATCH/DELETE）校验
+    /// `Sec-Fetch-Site` / `Origin`——跨站拒绝（含 `Origin: null`），同源与无来源头（curl / 服务间调用）放行。
+    /// **该检查先于回环豁免**：浏览器跨站请求的源 IP 恰为回环（localhost/面板免登录场景防护）。
+    pub csrf_guard: bool,
     /// SQL 注入动作（默认拦截）
     pub sqli_action: Action,
     /// XSS 动作（默认仅记录——表单富文本场景易误报）
@@ -105,6 +111,8 @@ impl WafConfig {
             block_malicious_bots: true,
             sensitive_prefixes: vec!["/admin".to_string()],
             skip_attack_prefixes: Vec::new(),
+            skip_bot_prefixes: Vec::new(),
+            csrf_guard: true,
             sqli_action: Action::Block,
             xss_action: Action::Monitor,
             path_action: Action::Block,
@@ -133,6 +141,8 @@ impl WafConfig {
             block_malicious_bots: true,
             sensitive_prefixes: Vec::new(),
             skip_attack_prefixes: Vec::new(),
+            skip_bot_prefixes: Vec::new(),
+            csrf_guard: true,
             sqli_action: Action::Block,
             xss_action: Action::Block,
             path_action: Action::Block,

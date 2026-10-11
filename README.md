@@ -12,6 +12,7 @@ Pek 系列 Web 应用防火墙（Rust 公共库，crate `pek-rwaf`）——对�
 | 🤖 爬虫分级 | 6 级分类：搜索引擎 / GEO-AI 抓取 / 社交预览（**放行**）；灰色 / 未知（记录+限速）；恶意爬虫与扫描器（**拦截**） |
 | 🧱 注入检测 | SQL 注入 / XSS / 路径穿越与敏感路径探测 / 命令注入；逐项动作（关/监控/拦截），双重 URL 解码防绕过 |
 | ⏱️ CC 限速 | 固定 60 秒窗口每 IP 计数；放行类机器人豁免；静态资源不计数 |
+| 🌐 跨站来源校验 | 浏览器**非安全方法**（POST/PUT/PATCH/DELETE）校验 `Sec-Fetch-Site`/`Origin`（CSRF 防护；**先于回环豁免**——localhost 面板免登录场景防恶意网页盲发）；无来源头（curl/服务间调用）放行 |
 | 📜 规则引擎 | **与 C# Pek.WAF 的 Ruleset JSON 格式兼容**（同一份规则可双端共用）+ 新增 `IsBotKind` |
 | 🚫 IP 名单 | 白名单（优先放行）/ 黑名单；精确、CIDR（`10.0.0.0/8`）、通配符（`192.168.*.*`）、文件 |
 | ♻️ 热重载 | `Config/Waf.json` 修改后 ≤10 秒自动生效（mtime 检查）；校验失败保留旧配置 |
@@ -106,8 +107,8 @@ router.use_middleware(waf.middleware());
 | `allowSearchBots` / `allowAiBots` / `allowSocialPreviews` | `false` | 放行三类正常抓取 |
 | `blockMaliciousBots` | `true` | 拦截恶意爬虫 |
 | `sensitivePrefixes` | `[]` | 敏感前缀（禁一切机器人 + 攻击监控升级拦截） |
-| `skipAttackPrefixes` | `[]` | 跳过攻击检测的路径前缀（如项目自带的在线 SQL / 文件管理端点，安全由业务层护栏负责；bot/IP/CC 不受影响） |
-| `sqliAction` / `xssAction` / `pathAction` / `cmdAction` | `"block"` | 逐项动作：`off` / `monitor` / `block` |
+| `skipAttackPrefixes` | `[]` | 跳过攻击检测的路径前缀（如项目自带的在线 SQL / 文件管理端点，安全由业务层护栏负责；bot/IP/CC 不受影响） || `skipBotPrefixes` | `[]` | 跳过机器人拦截的路径前缀（机器对机器 API——如产测工具调用接口；攻击检测/IP 名单/CC 不受影响） |
+| `csrfGuard` | `true` | 跨站来源校验（CSRF）：浏览器非安全方法校验 `Sec-Fetch-Site`/`Origin`，跨站（含 `Origin: null`）拒绝；先于回环豁免 || `sqliAction` / `xssAction` / `pathAction` / `cmdAction` | `"block"` | 逐项动作：`off` / `monitor` / `block` |
 | `rateLimitPerMin` | `300` | CC 限速（0=关） |
 | `logBlocked` / `verbose` | `true` / `false` | 拦截日志 / 详细日志 |
 | `ruleset` | `null` | C# 兼容规则树 |
