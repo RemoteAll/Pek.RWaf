@@ -79,6 +79,9 @@ pub struct Waf {
     config: RwLock<WafConfig>,
     compiled_rules: RwLock<Vec<Compiled>>,
     limiter: RateLimiter,
+    /// 可信业务请求签名密钥（DHDeploy 的 TimeStamp/Nonce/Signature 头；只存内存，
+    /// 不落 Config/Waf.json，面板保存配置不会把它清掉）
+    trusted_secret: RwLock<Option<String>>,
     file: Option<PathBuf>,
     base_dir: PathBuf,
     last_check: AtomicI64,
@@ -92,6 +95,7 @@ impl Waf {
             config: RwLock::new(config),
             compiled_rules: RwLock::new(Vec::new()),
             limiter: RateLimiter::new(),
+            trusted_secret: RwLock::new(None),
             file: None,
             base_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             last_check: AtomicI64::new(0),
@@ -125,6 +129,7 @@ impl Waf {
             config: RwLock::new(config),
             compiled_rules: RwLock::new(Vec::new()),
             limiter: RateLimiter::new(),
+            trusted_secret: RwLock::new(None),
             file: Some(file),
             base_dir: base.to_path_buf(),
             last_check: AtomicI64::new(0),
@@ -132,6 +137,58 @@ impl Waf {
         };
         waf.recompile();
         Arc::new(waf)
+    }
+
+    /// 设置可信业务请求签名密钥（内存态，不写配置文件；空串=关闭）。
+    ///
+    /// 请求携带 `TimeStamp`/`Nonce`/`Signature` 三头且签名复验通过时直接放行 WAF
+    /// （业务层仍会做时间窗/重放/权限校验）；签名不过的请求仍按原有规则拦截。
+    pub fn set_trusted_signature_secret(&self, secret: impl Into<String>) {
+        let secret = secret.into();
+        let value = if secret.trim().is_empty() {
+            None
+        } else {
+            Some(secret.trim().to_string())
+        };
+        match self.trusted_secret.write() {
+            Ok(mut w) => *w = value,
+            Err(p) => *p.into_inner() = value,
+        }
+    }
+
+    /// 请求签名是否为当前可信业务请求（SHA1(排序后的 timestamp+nonce+secret)）。
+    fn trusted_signed(&self, req: &dhrust::net::http::HttpRequest) -> bool {
+        let secret = match self.trusted_secret.read() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        };
+        let Some(secret) = secret else {
+            return false;
+        };
+        let timestamp = req.header("TimeStamp").unwrap_or("").trim();
+        let nonce = req.header("Nonce").unwrap_or("").trim();
+        let signature = req.header("Signature").unwrap_or("").trim();
+        if timestamp.is_empty() || nonce.is_empty() || signature.is_empty() {
+            return false;
+        }
+        let expect = dhrust::sign::create_signature(
+            timestamp.to_string(),
+            nonce.to_string(),
+            secret,
+        );
+        if expect.is_empty() {
+            return false;
+        }
+        // 定时攻击防护：等长逐字节比较
+        let (a, b) = (expect.as_bytes(), signature.as_bytes());
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut diff = 0u8;
+        for (x, y) in a.iter().zip(b.iter()) {
+            diff |= x ^ y;
+        }
+        diff == 0
     }
 
     /// 当前配置副本（面板展示用）。
@@ -254,6 +311,11 @@ impl Waf {
 
     /// 对原始 HTTP 请求执行检查（中间件入口）。
     pub fn check_http(&self, req: &dhrust::net::http::HttpRequest) -> Verdict {
+        // 可信业务请求（DHDeploy 客户端等）按共享密钥签名放行；不依赖 UA，避免 RestSharp/
+        // python-requests 等正常机器客户端被当成扫描器；签名不通过仍走原规则。
+        if self.trusted_signed(req) {
+            return Verdict::Allow;
+        }
         let wreq = WafRequest::from_http(req);
         // CSRF/跨站来源校验先于回环豁免：浏览器跨站请求的源 IP 恰是回环（localhost/面板免登录场景防护）。
         // 无 Sec-Fetch-Site 与 Origin 的请求（curl / 服务间调用 / 旧客户端）不进此分支。
@@ -596,6 +658,31 @@ mod tests {
             body: bytes::Bytes::new(),
             remote_addr: Some("127.0.0.1:5000".to_string()),
         }
+    }
+
+    #[test]
+    fn trusted_signature_bypasses_bot_block() {
+        let mut cfg = WafConfig::admin_api();
+        cfg.loopback_bypass = false; // 测试用 hreq 是回环地址，关掉豁免才能验证 bot 拦截
+        let waf = Waf::new(cfg);
+        waf.set_trusted_signature_secret("s3cret");
+
+        let ts = dhrust::times::getmilltimestamp().to_string();
+        let nonce = "n-123456";
+        let sig = dhrust::sign::create_signature(ts.clone(), nonce.to_string(), "s3cret".to_string());
+        let signed = hreq(
+            "POST",
+            vec![
+                ("User-Agent", "RestSharp/114.0.0.0"),
+                ("TimeStamp", &ts),
+                ("Nonce", nonce),
+                ("Signature", &sig),
+            ],
+        );
+        assert_eq!(waf.check_http(&signed).blocked_status(), None);
+
+        let unsigned = hreq("POST", vec![("User-Agent", "RestSharp/114.0.0.0")]);
+        assert_eq!(waf.check_http(&unsigned).blocked_status(), Some(403));
     }
 
     #[test]

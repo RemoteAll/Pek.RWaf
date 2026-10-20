@@ -70,6 +70,21 @@ router.use_middleware(waf.middleware());
 
 普通浏览器、移动端与 Flutter/Dart App（`Dart/x.x (dart:io)`）不命中任何名单，不受影响。
 
+## 可信业务请求（不新增密钥）
+
+机器对机器调用不应由“User-Agent 是否像爬虫”来决定放行，WAF 提供两种**无新增密钥**的方式：
+
+1. **复用项目已有的签名头**（推荐，若项目已有 HMAC 签名）：
+   - `Waf::set_trusted_signature_secret(secret)`（内存态，不写 `Config/Waf.json`，面板保存配置不会清掉）；
+   - 请求带 `TimeStamp` / `Nonce` / `Signature` 三头，且按现有算法（`SHA1(排序后的 timestamp+nonce+secret)`）复验通过 → 放行 WAF；
+   - 密钥由项目已有的共享密钥提供（如 DHDeploy 的 `AgentSecret`），**不需要额外配置**；业务层仍做时间窗/重放/权限校验。
+2. **按 API 路径跳过“爬虫 UA 判定”**（通用，适用于没有签名的项目）：
+   - `skipBotPrefixes: ["/api"]`；
+   - 只跳过 bot 分类，**攻击特征、IP 名单、CC 限速仍然生效**；
+   - 真正的鉴权仍由业务层（JWT / API Token / 签名 / 会话）负责——**WAF 的 bot 判定不是鉴权层**。
+
+> 不要为 WAF 再引入一个静态“可信头密钥”：那是新增凭据、需要轮换，且静态值同样可能被窃取；优先复用项目已有的签名/令牌体系，或使用 `skipBotPrefixes` + 业务鉴权。
+
 ## 规则引擎（C# 兼容）
 
 `Config/Waf.json` 的 `ruleset` 字段与 C# `Pek.WAF` 的 Ruleset JSON **同格式**（PascalCase），命中即拦截：
