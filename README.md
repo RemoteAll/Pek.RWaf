@@ -85,6 +85,15 @@ router.use_middleware(waf.middleware());
 
 > 不要为 WAF 再引入一个静态“可信头密钥”：那是新增凭据、需要轮换，且静态值同样可能被窃取；优先复用项目已有的签名/令牌体系，或使用 `skipBotPrefixes` + 业务鉴权。
 
+### 本地请求怎么放行（不需要密钥）
+
+- **同机 `127.0.0.1` / `::1` 直连**：`loopbackBypass` 默认就是 `true`，**直接放行，什么都不用配**；
+- **如果关掉了 `loopbackBypass`**：用 `ipWhitelist: ["127.0.0.1", "::1"]`，同样不需要密钥；
+- **本机但通过公网 IP / 容器网络 / 反向代理访问**：不要依赖回环豁免（代理会把真实客户端也变成 127.0.0.1，等于全放行）。推荐 `skipBotPrefixes: ["/api"]` + 业务层 JWT/Token/签名鉴权；必要时再配 `ipWhitelist` 指向可信网段；
+- **反向代理到 127.0.0.1**：WAF 需要“可信代理 + 真实 IP”能力才能既豁免本机又区分外部客户端；当前版本尚未内置 `trustedProxies`，此类部署应先不要开 `loopbackBypass`，用 `skipBotPrefixes` + 业务鉴权兜底。
+
+> 结论：本地直连用**回环豁免/IP 白名单**；跨进程/跨机/反代用 **`skipBotPrefixes` + 业务鉴权**；都不需要新增共享密钥。WAF 的 bot 判定不是鉴权层。
+
 ## 规则引擎（C# 兼容）
 
 `Config/Waf.json` 的 `ruleset` 字段与 C# `Pek.WAF` 的 Ruleset JSON **同格式**（PascalCase），命中即拦截：
