@@ -1,0 +1,14 @@
+# 本机 crates.io 直连不稳定/偏慢，使用国内镜像（rsproxy）——与 DH.RustBase / Pek.RCode / Pek.RAgent / HLZX.EIP / Pek.RPanlServer 一致。
+# 说明：`replace-with` 对 registry 源是透明替换，Cargo.lock 里记录的仍是 crates.io 源地址，不产生锁文件抖动。
+# 如所在网络无法访问 rsproxy.cn，可删除本文件改用内网镜像或直连。
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[registries.rsproxy]
+index = "sparse+https://rsproxy.cn/index/"
+
+[net]
+git-fetch-with-cli = true

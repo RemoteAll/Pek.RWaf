@@ -21,3 +21,11 @@ bytes = "1"
 lto = "thin"
 strip = true
 incremental = true
+
+# 日常调测档（与生态各仓一致）：继承 release 的优化等级，但关闭 LTO、并行 codegen + 增量。
+# 本库只被宿主以 path 依赖引入，本机验证 `cargo check` 即可；需要跑起来时用 `cargo build --profile fast`。
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
