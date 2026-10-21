@@ -82,6 +82,10 @@ pub struct Waf {
     /// 可信业务请求签名密钥（DHDeploy 的 TimeStamp/Nonce/Signature 头；只存内存，
     /// 不落 Config/Waf.json，面板保存配置不会把它清掉）
     trusted_secret: RwLock<Option<String>>,
+    /// 强制跳过机器人拦截的路径前缀（内存态：不落配置文件、面板保存也不会清掉）
+    forced_skip_bot: RwLock<Vec<String>>,
+    /// 强制跳过攻击特征检测的路径前缀（同上）
+    forced_skip_attack: RwLock<Vec<String>>,
     file: Option<PathBuf>,
     /// 创建时的预设配置（部分键缺失的旧文件/面板提交用其补齐）
     preset: WafConfig,
@@ -98,6 +102,8 @@ impl Waf {
             compiled_rules: RwLock::new(Vec::new()),
             limiter: RateLimiter::new(),
             trusted_secret: RwLock::new(None),
+            forced_skip_bot: RwLock::new(Vec::new()),
+            forced_skip_attack: RwLock::new(Vec::new()),
             file: None,
             preset: config,
             base_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -133,6 +139,8 @@ impl Waf {
             compiled_rules: RwLock::new(Vec::new()),
             limiter: RateLimiter::new(),
             trusted_secret: RwLock::new(None),
+            forced_skip_bot: RwLock::new(Vec::new()),
+            forced_skip_attack: RwLock::new(Vec::new()),
             file: Some(file),
             preset: default,
             base_dir: base.to_path_buf(),
@@ -158,6 +166,43 @@ impl Waf {
             Ok(mut w) => *w = value,
             Err(p) => *p.into_inner() = value,
         }
+    }
+
+    /// 强制跳过机器人（爬虫/扫描器 UA）拦截的路径前缀——**内存态**，不落配置文件、
+    /// 面板保存配置（会写全字段，可能把 `skipBotPrefixes` 写成空数组）也不会清掉。
+    ///
+    /// 机器对机器 API（如 DHDeploy Agent 的 `/api/*`）应使用本方法注册，
+    /// 避免客户端 UA（RestSharp/HttpClient/python-requests…）被误判为扫描器。
+    pub fn set_forced_skip_bot_prefixes(&self, prefixes: Vec<String>) {
+        match self.forced_skip_bot.write() {
+            Ok(mut w) => *w = prefixes,
+            Err(p) => *p.into_inner() = prefixes,
+        }
+    }
+
+    /// 强制跳过攻击特征检测的路径前缀（内存态；同上）。
+    ///
+    /// 用于「本体即执行 SQL / 传文件 / 跑命令」的管理端点——安全由业务层护栏负责。
+    pub fn set_forced_skip_attack_prefixes(&self, prefixes: Vec<String>) {
+        match self.forced_skip_attack.write() {
+            Ok(mut w) => *w = prefixes,
+            Err(p) => *p.into_inner() = prefixes,
+        }
+    }
+
+    /// 当前生效的强制豁免前缀（诊断用：(bot, attack)）。
+    pub fn forced_skip_prefixes(&self) -> (Vec<String>, Vec<String>) {
+        let bot = self
+            .forced_skip_bot
+            .read()
+            .map(|v| v.clone())
+            .unwrap_or_default();
+        let attack = self
+            .forced_skip_attack
+            .read()
+            .map(|v| v.clone())
+            .unwrap_or_default();
+        (bot, attack)
     }
 
     /// 请求签名是否为当前可信业务请求（SHA1(排序后的 timestamp+nonce+secret)）。
@@ -377,8 +422,18 @@ impl Waf {
         let sensitive = !cfg.sensitive_prefixes.is_empty()
             && cfg.sensitive_prefixes.iter().any(|p| req.path.starts_with(p.as_str()));
         // 跳过机器人拦截的路径前缀（机器对机器 API；攻击检测/CC 不受影响）
-        let skip_bot = !cfg.skip_bot_prefixes.is_empty()
-            && cfg.skip_bot_prefixes.iter().any(|p| req.path.starts_with(p.as_str()));
+        // skip_bot_prefixes 来自配置文件（面板保存会写全字段，可能被显式写成空数组），
+        // 因此另支持「强制豁免」（内存态，进程内设定后不可被配置覆盖）。
+        let skip_bot = (!cfg.skip_bot_prefixes.is_empty()
+            && cfg
+                .skip_bot_prefixes
+                .iter()
+                .any(|p| req.path.starts_with(p.as_str())))
+            || self
+                .forced_skip_bot
+                .read()
+                .map(|v| v.iter().any(|p| req.path.starts_with(p.as_str())))
+                .unwrap_or(false);
 
         // —— 爬虫分类 ——
         let mut friendly_bot = false;
@@ -454,8 +509,16 @@ impl Waf {
         }
 
         // —— 攻击特征（skipAttackPrefixes 下的管理端点跳过——如在线 SQL/文件管理，由业务层护栏负责）——
-        let skip_attack = !cfg.skip_attack_prefixes.is_empty()
-            && cfg.skip_attack_prefixes.iter().any(|p| req.path.starts_with(p.as_str()));
+        let skip_attack = (!cfg.skip_attack_prefixes.is_empty()
+            && cfg
+                .skip_attack_prefixes
+                .iter()
+                .any(|p| req.path.starts_with(p.as_str())))
+            || self
+                .forced_skip_attack
+                .read()
+                .map(|v| v.iter().any(|p| req.path.starts_with(p.as_str())))
+                .unwrap_or(false);
         if !skip_attack {
             for kind in attack::scan_all(&req.path, &req.query, &req.body_text) {
                 let mut action = match kind {
@@ -951,6 +1014,28 @@ mod tests {
         let mut r3 = wreq("/");
         r3.user_agent = "python-requests/2.31".into();
         assert_eq!(waf.check(&r3).blocked_status(), Some(403));
+    }
+
+    #[test]
+    fn forced_skip_bot_overrides_explicit_empty_config() {
+        // 线上故障场景：配置文件被面板保存后写成 "skipBotPrefixes": []（显式空）
+        let mut cfg = WafConfig::admin_api();
+        cfg.skip_bot_prefixes = Vec::new();
+        let waf = Waf::new(cfg);
+        let mut r = wreq("/api/v1/DirectFileManager/List");
+        r.user_agent = "RestSharp/114.0.0.0".into();
+        // 未注册强制豁免：仍按配置拦（复现线上日志）
+        assert_eq!(waf.check(&r).blocked_status(), Some(403));
+
+        // 注册强制豁免后：即便配置显式空也放行
+        waf.set_forced_skip_bot_prefixes(vec!["/api".to_string()]);
+        assert!(waf.check(&r).is_allow(), "强制豁免应覆盖配置文件的显式空数组");
+        assert_eq!(waf.forced_skip_prefixes().0, vec!["/api".to_string()]);
+
+        // 前缀之外不受影响
+        let mut r2 = wreq("/other");
+        r2.user_agent = "RestSharp/114.0.0.0".into();
+        assert_eq!(waf.check(&r2).blocked_status(), Some(403));
     }
 
     #[test]
