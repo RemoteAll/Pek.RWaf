@@ -83,6 +83,8 @@ pub struct Waf {
     /// 不落 Config/Waf.json，面板保存配置不会把它清掉）
     trusted_secret: RwLock<Option<String>>,
     file: Option<PathBuf>,
+    /// 创建时的预设配置（部分键缺失的旧文件/面板提交用其补齐）
+    preset: WafConfig,
     base_dir: PathBuf,
     last_check: AtomicI64,
     last_mtime: AtomicU64,
@@ -92,11 +94,12 @@ impl Waf {
     /// 以内存配置构建（无文件热重载）。
     pub fn new(config: WafConfig) -> Arc<Self> {
         let waf = Self {
-            config: RwLock::new(config),
+            config: RwLock::new(config.clone()),
             compiled_rules: RwLock::new(Vec::new()),
             limiter: RateLimiter::new(),
             trusted_secret: RwLock::new(None),
             file: None,
+            preset: config,
             base_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             last_check: AtomicI64::new(0),
             last_mtime: AtomicU64::new(0),
@@ -115,13 +118,13 @@ impl Waf {
         let file = base.join("Config").join("Waf.json");
         let config = if !file.exists() {
             let _ = default.save(&file);
-            default
+            default.clone()
         } else {
-            match WafConfig::load_or_create(&file) {
+            match WafConfig::load_merging(&file, &default) {
                 Ok(c) => c,
                 Err(e) => {
                     dhrust::logs::log().warn(&format!("[WAF] 配置加载失败，使用默认策略：{e}"));
-                    default
+                    default.clone()
                 }
             }
         };
@@ -131,6 +134,7 @@ impl Waf {
             limiter: RateLimiter::new(),
             trusted_secret: RwLock::new(None),
             file: Some(file),
+            preset: default,
             base_dir: base.to_path_buf(),
             last_check: AtomicI64::new(0),
             last_mtime: AtomicU64::new(0),
@@ -229,7 +233,7 @@ impl Waf {
             let _ = current.save(&file);
             return;
         }
-        match WafConfig::load_or_create(&file) {
+        match WafConfig::load_merging(&file, &self.preset) {
             Ok(cfg) => {
                 match self.config.write() {
                     Ok(mut w) => *w = cfg,

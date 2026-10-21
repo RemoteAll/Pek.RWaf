@@ -167,6 +167,23 @@ impl WafConfig {
             .map_err(|e| format!("解析 {} 失败：{e}", path.display()))
     }
 
+    /// 从 `path` 加载；文件中缺失的字段用 `default` 补齐（文件优先）。
+    ///
+    /// 与 [`Self::load_or_create`] 的差别：后者缺失字段落回 `WafConfig::default()`，
+    /// 会丢掉调用方预设（例如 DHDeploy Agent 的 `skipBotPrefixes=["/api"]`）——
+    /// 旧版本生成的配置文件不含新字段时，预设被静默清空
+    /// （2026-10-21 直连 `RestSharp` UA 被误拦即此原因）。
+    pub fn load_merging(path: &Path, default: &Self) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("读取 {} 失败：{e}", path.display()))?;
+        let mut base = serde_json::to_value(default)
+            .map_err(|e| format!("序列化预设配置失败：{e}"))?;
+        let over: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| format!("解析 {} 失败：{e}", path.display()))?;
+        merge_missing(&mut base, &over);
+        serde_json::from_value(base).map_err(|e| format!("解析 {} 失败：{e}", path.display()))
+    }
+
     /// 保存到 `path`（自动建目录）。
     pub fn save(&self, path: &Path) -> Result<(), String> {
         if let Some(dir) = path.parent() {
@@ -174,6 +191,23 @@ impl WafConfig {
         }
         let text = serde_json::to_string_pretty(self).map_err(|e| format!("序列化失败：{e}"))?;
         std::fs::write(path, text).map_err(|e| format!("写入 {} 失败：{e}", path.display()))
+    }
+}
+
+/// 把 `over` 合并进 `base`：对象递归合并，`over` 中缺失的键保留 `base` 的值。
+fn merge_missing(base: &mut serde_json::Value, over: &serde_json::Value) {
+    match (base, over) {
+        (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
+            for (k, v) in o {
+                match b.get_mut(k) {
+                    Some(slot) => merge_missing(slot, v),
+                    None => {
+                        b.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        (slot, v) => *slot = v.clone(),
     }
 }
 
@@ -199,6 +233,34 @@ mod tests {
         let partial = WafConfig::load_or_create(&file).unwrap();
         assert_eq!(partial.mode, WafMode::AdminApi); // 落回默认（admin_api）
         assert_eq!(partial.rate_limit_per_min, 300);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_missing_keys_inherit_preset() {
+        let dir = std::env::temp_dir().join(format!("pek-waf-merge-{}", std::process::id()));
+        let file = dir.join("Waf.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 旧文件：不含 skipBotPrefixes（模拟升级前生成）
+        std::fs::write(&file, r#"{ "enable": true, "blockMaliciousBots": true }"#).unwrap();
+
+        let mut preset = WafConfig::admin_api();
+        preset.skip_bot_prefixes = vec!["/api".to_string()];
+        preset.skip_attack_prefixes = vec!["/api".to_string()];
+
+        let merged = WafConfig::load_merging(&file, &preset).unwrap();
+        // 文件里的值优先
+        assert!(merged.enable);
+        assert!(merged.block_malicious_bots);
+        // 文件缺失的键继承预设
+        assert_eq!(merged.skip_bot_prefixes, vec!["/api".to_string()]);
+        assert_eq!(merged.skip_attack_prefixes, vec!["/api".to_string()]);
+
+        // 文件里显式给出空数组时尊重文件（不继承预设）
+        std::fs::write(&file, r#"{ "skipBotPrefixes": [] }"#).unwrap();
+        let merged2 = WafConfig::load_merging(&file, &preset).unwrap();
+        assert!(merged2.skip_bot_prefixes.is_empty());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
