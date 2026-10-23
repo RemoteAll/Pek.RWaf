@@ -140,5 +140,5 @@ router.use_middleware(waf.middleware());
 ## 落地记录
 
 - 2026-10-23 配置改 TOML：`Config/Waf.json` → **`Config/Waf.toml`**（可写注释），旧文件自动迁移并备份为
-  `.json.bak`（迁移时缺失键继承调用方预设，保持升级前行为）；读写委托 `dhrust::config::TomlConfig<T>`
+  `.json.bak`（迁移由 `dhrust::config::TomlConfig<T>` 自动完成：缺失键继承调用方预设，本库不写迁移代码）；读写委托 `dhrust::config::TomlConfig<T>`
   （缺失生成/缺键带注释补齐/类型容错/损坏备份重建），本库不再自实现配置管线。35 单测全绿。

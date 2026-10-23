@@ -120,22 +120,13 @@ impl Waf {
     }
 
     /// 同 [`Waf::load`]，但首启生成的模板使用指定预设（如前台站点用 [`WafConfig::public_site`]）。
+    ///
+    /// 升级场景（旧版 `Config/Waf.json` 存在）：由 `dhrust::config::TomlConfig` 自动迁移，
+    /// 旧文件缺失的键继承本预设，不需要本库写迁移代码。
     pub fn load_with_default(base: &Path, default: WafConfig) -> Arc<Self> {
         let file = base.join(crate::config::CONFIG_REL);
-        if !file.exists() {
-            // ① 旧版 Config/Waf.json 优先迁移（升级场景）；② 否则按预设生成新配置
-            match WafConfig::migrate_legacy_json(&file, &default) {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    let _ = default.save(&file);
-                }
-                Err(e) => {
-                    dhrust::logs::log().warn(&format!(
-                        "[WAF] 旧版配置迁移失败：{e}（按预设生成新配置）"
-                    ));
-                    let _ = default.save(&file);
-                }
-            }
+        if !file.exists() && !file.with_extension("json").exists() {
+            let _ = default.save(&file);
         }
         let config = match WafConfig::load_merging(&file, &default) {
             Ok(c) => c,

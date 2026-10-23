@@ -168,13 +168,11 @@ impl WafConfig {
 
     /// 从 `path` 加载；文件不存在时写入默认模板并返回默认。
     ///
-    /// `path` 指向 `Config/Waf.toml`；若它不存在但同目录的 `Waf.json` 存在，先迁移（写 TOML、
-    /// 旧文件备份为 `.json.bak`）。
+    /// `path` 指向 `Config/Waf.toml`；若它不存在但同目录的 `Waf.json` 存在，
+    /// **由 `dhrust::config::TomlConfig` 自动迁移**（写 TOML、旧文件备份为 `.json.bak`，
+    /// 缺失键继承本调用预设）——本库不写迁移代码。
     pub fn load_or_create(path: &Path) -> Result<Self, String> {
-        if let Some(cfg) = Self::migrate_legacy_json(path, &Self::default())? {
-            return Ok(cfg);
-        }
-        if !path.exists() {
+        if !path.exists() && !path.with_extension("json").exists() {
             let cfg = Self::default();
             let _ = cfg.save(path); // 写失败不致命（如只读目录）
             return Ok(cfg);
@@ -182,50 +180,16 @@ impl WafConfig {
         Self::load_file(path, &Self::default())
     }
 
-    /// 旧版 JSON 配置迁移：`path`（TOML）不存在、同目录 `Waf.json` 存在时，
-    /// 读旧配置（**缺失键用 `default` 补齐**，保持升级前的有效行为）→ 写 TOML →
-    /// 旧文件备份为 `.json.bak`。
-    ///
-    /// 返回 `Some(配置)` 表示发生了迁移；`None` 表示无需迁移。
-    pub fn migrate_legacy_json(path: &Path, default: &Self) -> Result<Option<Self>, String> {
-        let legacy = path.with_extension("json");
-        if path.exists() || !legacy.exists() {
-            return Ok(None);
-        }
-        // 与 `load_merging` 同语义：文件优先，缺失键继承预设。
-        // 注意：旧文件必须按**原始 JSON** 解析（不能先反序列化成 WafConfig——那会把缺失键
-        // 填成结构体默认值，导致调用方预设被覆盖）。
-        let text = std::fs::read_to_string(&legacy)
-            .map_err(|e| format!("读取 {} 失败：{e}", legacy.display()))?;
-        let over: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
-            .map_err(|e| format!("解析 {} 失败：{e}", legacy.display()))?;
-        let mut base = serde_json::to_value(default)
-            .map_err(|e| format!("序列化预设配置失败：{e}"))?;
-        merge_json(&mut base, &over);
-        let cfg: Self = serde_json::from_value(base)
-            .map_err(|e| format!("合并旧版配置失败：{e}"))?;
-        cfg.save(path)?;
-        match std::fs::rename(&legacy, legacy.with_extension("json.bak")) {
-            Ok(()) => dhrust::logs::log().info(&format!(
-                "[WAF] 配置已从 {} 迁移为 {}（旧文件已备份）",
-                legacy.display(),
-                path.display()
-            )),
-            Err(e) => dhrust::logs::log().warn(&format!(
-                "[WAF] 旧版配置 {} 重命名失败：{e}（新配置已生成，请手工删除）",
-                legacy.display()
-            )),
-        }
-        Ok(Some(cfg))
-    }
-
-    /// 从 `path` 加载；文件中缺失的字段用 `default` 补齐（文件优先）。
+    /// 从 `path` 加载；文件中缺失的字段用 `default` 补齐（文件优先；旧版 JSON 自动迁移）。
     ///
     /// 与 [`Self::load_or_create`] 的差别：后者缺失字段落回 `WafConfig::default()`，
     /// 会丢掉调用方预设（例如 DHDeploy Agent 的 `skipBotPrefixes=["/api"]`）——
     /// 旧版本生成的配置文件不含新字段时，预设被静默清空
     /// （2026-10-21 直连 `RestSharp` UA 被误拦即此原因）。
     pub fn load_merging(path: &Path, default: &Self) -> Result<Self, String> {
+        if !path.exists() && !path.with_extension("json").exists() {
+            return Err(format!("配置文件不存在：{}", path.display()));
+        }
         Self::load_file(path, default)
     }
 
@@ -262,22 +226,6 @@ impl WafConfig {
     }
 }
 
-/// 把 `over` 递归合并进 `base`：`over` 中缺失的键保留 `base` 的值（旧版 JSON 迁移用）。
-fn merge_json(base: &mut serde_json::Value, over: &serde_json::Value) {
-    match (base, over) {
-        (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
-            for (k, v) in o {
-                match b.get_mut(k) {
-                    Some(slot) => merge_json(slot, v),
-                    None => {
-                        b.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-        }
-        (slot, v) => *slot = v.clone(),
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;
