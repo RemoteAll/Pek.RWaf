@@ -1,4 +1,4 @@
-# Pek.RWaf
+﻿# Pek.RWaf
 
 Pek 系列 Web 应用防火墙（Rust 公共库，crate `pek-rwaf`）——对齐 C# [`Pek.WAF`](../Pek.FrameWork/Pek.WAF) 的功能并扩展
 「爬虫分级治理」与「CC 限速」，以 [dhrust](../DH.RustBase) 中间件形式接入任意 HTTP 服务。
@@ -15,7 +15,7 @@ Pek 系列 Web 应用防火墙（Rust 公共库，crate `pek-rwaf`）——对�
 | 🌐 跨站来源校验 | 浏览器**非安全方法**（POST/PUT/PATCH/DELETE）校验 `Sec-Fetch-Site`/`Origin`（CSRF 防护；**先于回环豁免**——localhost 面板免登录场景防恶意网页盲发）；无来源头（curl/服务间调用）放行 |
 | 📜 规则引擎 | **与 C# Pek.WAF 的 Ruleset JSON 格式兼容**（同一份规则可双端共用）+ 新增 `IsBotKind` |
 | 🚫 IP 名单 | 白名单（优先放行）/ 黑名单；精确、CIDR（`10.0.0.0/8`）、通配符（`192.168.*.*`）、文件 |
-| ♻️ 热重载 | `Config/Waf.json` 修改后 ≤10 秒自动生效（mtime 检查）；校验失败保留旧配置 |
+| ♻️ 热重载 | `Config/Waf.toml` 修改后 ≤10 秒自动生效（mtime 检查）；校验失败保留旧配置 |
 | 🔓 回环豁免 | `127.0.0.1`/`::1` 默认豁免（保护本地工具与冒烟脚本；生产可关） |
 
 > 与数据库安全的关系：本库是**外围第一道防线**；数据访问统一走 Pek.RCode 参数化 ORM 是**根本防线**，两者纵深配合。
@@ -26,7 +26,7 @@ Pek 系列 Web 应用防火墙（Rust 公共库，crate `pek-rwaf`）——对�
 // 1. Cargo.toml
 // pek-rwaf = { path = "../Pek.RWaf" }
 
-// 2. 启动时加载（读 {base}/Config/Waf.json；首启自动生成模板）
+// 2. 启动时加载（读 {base}/Config/Waf.toml；首启自动生成模板）
 let waf = pek_rwaf::Waf::load(&base);
 
 // 3. 路由装配首行挂中间件（全部路由生效）
@@ -47,7 +47,7 @@ router.use_middleware(waf.middleware());
 | XSS / 命令注入 | 仅记录（表单易误报） | 拦截 |
 | CC 限速 | 600 次/分钟 | 300 次/分钟 |
 
-首启生成的 `Config/Waf.json` 使用 `admin_api()` 默认值；前台项目在配置里改用如下组合即可：
+首启生成的 `Config/Waf.toml` 使用 `admin_api()` 默认值；前台项目在配置里改用如下组合即可：
 
 ```json
 { "mode": "publicSite", "allowSearchBots": true, "allowAiBots": true,
@@ -75,7 +75,7 @@ router.use_middleware(waf.middleware());
 机器对机器调用不应由“User-Agent 是否像爬虫”来决定放行，WAF 提供两种**无新增密钥**的方式：
 
 1. **复用项目已有的签名头**（推荐，若项目已有 HMAC 签名）：
-   - `Waf::set_trusted_signature_secret(secret)`（内存态，不写 `Config/Waf.json`，面板保存配置不会清掉）；
+   - `Waf::set_trusted_signature_secret(secret)`（内存态，不写 `Config/Waf.toml`，面板保存配置不会清掉）；
    - 请求带 `TimeStamp` / `Nonce` / `Signature` 三头，且按现有算法（`SHA1(排序后的 timestamp+nonce+secret)`）复验通过 → 放行 WAF；
    - 密钥由项目已有的共享密钥提供（如 DHDeploy 的 `AgentSecret`），**不需要额外配置**；业务层仍做时间窗/重放/权限校验。
 2. **按 API 路径跳过“爬虫 UA 判定”**（通用，适用于没有签名的项目）：
@@ -96,7 +96,7 @@ router.use_middleware(waf.middleware());
 
 ## 规则引擎（C# 兼容）
 
-`Config/Waf.json` 的 `ruleset` 字段与 C# `Pek.WAF` 的 Ruleset JSON **同格式**（PascalCase），命中即拦截：
+`Config/Waf.toml` 的 `ruleset` 字段与 C# `Pek.WAF` 的 Ruleset JSON **同格式**（PascalCase；TOML 里写成表/内联表），命中即拦截：
 
 ```json
 {
@@ -118,7 +118,7 @@ router.use_middleware(waf.middleware());
 - `IsBotKind` 目标值：`SearchEngine` / `AiCrawler` / `SocialPreview` / `Monitor` / `Malicious` / `Unknown` / `Any` / `friendly`。
 - 说明：`IpCountry` 需外部 GeoIP 数据（未内置，恒不命中）；`IpInFile` 相对 `Config/` 所属基础目录解析。
 
-## 配置参考（`Config/Waf.json`，camelCase）
+## 配置参考（`Config/Waf.toml`，camelCase）
 
 | 字段 | 默认（admin_api） | 说明 |
 | --- | --- | --- |
@@ -135,8 +135,10 @@ router.use_middleware(waf.middleware());
 | `csrfGuard` | `true` | 跨站来源校验（CSRF）：浏览器非安全方法校验 `Sec-Fetch-Site`/`Origin`，跨站（含 `Origin: null`）拒绝；先于回环豁免 || `sqliAction` / `xssAction` / `pathAction` / `cmdAction` | `"block"` | 逐项动作：`off` / `monitor` / `block` |
 | `rateLimitPerMin` | `300` | CC 限速（0=关） |
 | `logBlocked` / `verbose` | `true` / `false` | 拦截日志 / 详细日志 |
-| `ruleset` | `null` | C# 兼容规则树 |
+| `ruleset` | （缺省不写） | C# 兼容规则树（TOML 表/内联表；键名仍用 PascalCase） |
 
 ## 落地记录
 
-- 2026-10-11 建库：24 单测 + 1 文档测试全绿、clippy 零警告。
+- 2026-10-23 配置改 TOML：`Config/Waf.json` → **`Config/Waf.toml`**（可写注释），旧文件自动迁移并备份为
+  `.json.bak`（迁移时缺失键继承调用方预设，保持升级前行为）；读写委托 `dhrust::config::TomlConfig<T>`
+  （缺失生成/缺键带注释补齐/类型容错/损坏备份重建），本库不再自实现配置管线。35 单测全绿。

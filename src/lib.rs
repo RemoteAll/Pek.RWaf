@@ -11,7 +11,7 @@
 //! - **自定义规则**（[`rules`]）：JSON 规则集，**与 C# Pek.WAF 的 Ruleset 格式兼容**（同一份规则文件可双端共用），
 //!   在 C# 操作符全集之上新增 `IsBotKind`（按爬虫分类命中）；
 //! - **dhrust 接入**（[`middleware`]）：`router.use_middleware(waf.middleware())` 一行接入洋葱链；
-//!   配置 `Config/Waf.json` 首启自动生成、改动热重载（mtime 节流检查）；回环地址默认豁免。
+//!   配置 `Config/Waf.toml` 首启自动生成、改动热重载（mtime 节流检查）；回环地址默认豁免。
 //!
 //! ## 快速接入（dhrust 服务）
 //!

@@ -7,10 +7,12 @@ authors = ["PeiKeSmart"]
 license = "MIT"
 
 [dependencies]
-# DH 基础库（Web 请求类型 + 日志）
-dhrust = { path = "../DH.RustBase", features = ["net"] }
+# DH 基础库（Web 请求类型 + 日志 + 配置管线：TOML 配置类的补齐/容错/原子写）
+dhrust = { path = "../DH.RustBase", features = ["net", "toml"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+# 配置文件（`Config/Waf.toml`）读写：条目结构由 dhrust `TomlConfig<T>` 负责，这里只作类型基准
+toml = "1"
 # 规则引擎正则（IsMatch 操作符；纯 Rust、可全平台 zig 交叉编译）
 regex = "1"
 

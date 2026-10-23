@@ -1,10 +1,22 @@
-//! WAF 配置：`Config/Waf.json`（首启自动生成模板；mtime 变化热重载）。
+//! WAF 配置：`Config/Waf.toml`（首启自动生成模板；mtime 变化热重载）。
+//!
+//! # 格式
+//! **TOML**（可写注释，运维可直接改文件）；读写统一走 `dhrust::config::TomlConfig`
+//! （= `Config<T>` 的 TOML 版：缺失生成、缺键带注释补齐、类型容错、损坏备份重建），
+//! 本库**不重复实现配置管线**。
+//!
+//! 旧版 `Config/Waf.json` 仍会被读取：首次加载时自动迁移为 TOML、原文件备份为 `Waf.json.bak`。
 
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::rules::Rule;
+
+/// 配置文件相对基础目录的路径。
+pub const CONFIG_REL: &str = "Config/Waf.toml";
+/// 旧版 JSON 配置（存在时自动迁移）。
+pub const LEGACY_CONFIG_REL: &str = "Config/Waf.json";
 
 /// 站点模式（决定默认策略组合与文档语义）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -28,7 +40,7 @@ pub enum Action {
     Block,
 }
 
-/// WAF 配置（`Config/Waf.json`；缺省字段自动补默认值）。
+/// WAF 配置（`Config/Waf.toml`；缺省字段自动补默认值）。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct WafConfig {
@@ -155,16 +167,56 @@ impl WafConfig {
     }
 
     /// 从 `path` 加载；文件不存在时写入默认模板并返回默认。
+    ///
+    /// `path` 指向 `Config/Waf.toml`；若它不存在但同目录的 `Waf.json` 存在，先迁移（写 TOML、
+    /// 旧文件备份为 `.json.bak`）。
     pub fn load_or_create(path: &Path) -> Result<Self, String> {
+        if let Some(cfg) = Self::migrate_legacy_json(path, &Self::default())? {
+            return Ok(cfg);
+        }
         if !path.exists() {
             let cfg = Self::default();
             let _ = cfg.save(path); // 写失败不致命（如只读目录）
             return Ok(cfg);
         }
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("读取 {} 失败：{e}", path.display()))?;
-        serde_json::from_str::<Self>(&text)
-            .map_err(|e| format!("解析 {} 失败：{e}", path.display()))
+        Self::load_file(path, &Self::default())
+    }
+
+    /// 旧版 JSON 配置迁移：`path`（TOML）不存在、同目录 `Waf.json` 存在时，
+    /// 读旧配置（**缺失键用 `default` 补齐**，保持升级前的有效行为）→ 写 TOML →
+    /// 旧文件备份为 `.json.bak`。
+    ///
+    /// 返回 `Some(配置)` 表示发生了迁移；`None` 表示无需迁移。
+    pub fn migrate_legacy_json(path: &Path, default: &Self) -> Result<Option<Self>, String> {
+        let legacy = path.with_extension("json");
+        if path.exists() || !legacy.exists() {
+            return Ok(None);
+        }
+        // 与 `load_merging` 同语义：文件优先，缺失键继承预设。
+        // 注意：旧文件必须按**原始 JSON** 解析（不能先反序列化成 WafConfig——那会把缺失键
+        // 填成结构体默认值，导致调用方预设被覆盖）。
+        let text = std::fs::read_to_string(&legacy)
+            .map_err(|e| format!("读取 {} 失败：{e}", legacy.display()))?;
+        let over: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
+            .map_err(|e| format!("解析 {} 失败：{e}", legacy.display()))?;
+        let mut base = serde_json::to_value(default)
+            .map_err(|e| format!("序列化预设配置失败：{e}"))?;
+        merge_json(&mut base, &over);
+        let cfg: Self = serde_json::from_value(base)
+            .map_err(|e| format!("合并旧版配置失败：{e}"))?;
+        cfg.save(path)?;
+        match std::fs::rename(&legacy, legacy.with_extension("json.bak")) {
+            Ok(()) => dhrust::logs::log().info(&format!(
+                "[WAF] 配置已从 {} 迁移为 {}（旧文件已备份）",
+                legacy.display(),
+                path.display()
+            )),
+            Err(e) => dhrust::logs::log().warn(&format!(
+                "[WAF] 旧版配置 {} 重命名失败：{e}（新配置已生成，请手工删除）",
+                legacy.display()
+            )),
+        }
+        Ok(Some(cfg))
     }
 
     /// 从 `path` 加载；文件中缺失的字段用 `default` 补齐（文件优先）。
@@ -174,33 +226,49 @@ impl WafConfig {
     /// 旧版本生成的配置文件不含新字段时，预设被静默清空
     /// （2026-10-21 直连 `RestSharp` UA 被误拦即此原因）。
     pub fn load_merging(path: &Path, default: &Self) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("读取 {} 失败：{e}", path.display()))?;
-        let mut base = serde_json::to_value(default)
-            .map_err(|e| format!("序列化预设配置失败：{e}"))?;
-        let over: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| format!("解析 {} 失败：{e}", path.display()))?;
-        merge_missing(&mut base, &over);
-        serde_json::from_value(base).map_err(|e| format!("解析 {} 失败：{e}", path.display()))
+        Self::load_file(path, default)
     }
 
-    /// 保存到 `path`（自动建目录）。
+    /// 以 `default` 为模板/类型基准读取 TOML（缺键补齐、类型容错；解析失败返回错误）。
+    fn load_file(path: &Path, default: &Self) -> Result<Self, String> {
+        let template = Self::template_of(default)?;
+        let opts = dhrust::config::ConfigOptions {
+            create_on_missing: false, // 由调用方决定是否创建
+            repair_corrupt: false,    // 热加载/报错场景不改动用户文件
+        };
+        let cfg = dhrust::config::TomlConfig::<Self>::try_load_with(path, &template, opts)
+            .map_err(|e| e.to_string())?;
+        Ok(cfg.into_value())
+    }
+
+    /// 保存到 `path`（自动建目录；以当前值为模板，保留已有注释）。
     pub fn save(&self, path: &Path) -> Result<(), String> {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let text = serde_json::to_string_pretty(self).map_err(|e| format!("序列化失败：{e}"))?;
-        std::fs::write(path, text).map_err(|e| format!("写入 {} 失败：{e}", path.display()))
+        let template = Self::template_of(self)?;
+        let mut cfg = dhrust::config::TomlConfig::from_value(path, &template, self.clone());
+        cfg.save().map_err(|e| e.to_string())
+    }
+
+    /// 生成带注释头的 TOML 模板（内容 = 给定配置；字段齐全）。
+    fn template_of(cfg: &Self) -> Result<String, String> {
+        let body = toml::to_string_pretty(cfg).map_err(|e| format!("序列化 WAF 配置失败：{e}"))?;
+        Ok(format!(
+            "# Pek.WAF 配置（TOML；保存后自动热生效）\n\
+             # 字段含义见 Pek.RWaf 文档 / 宿主后台「安全」页；可手工修改后保存。\n\
+             # 旧版 Config/Waf.json 会在首次启动时自动迁移为本文件（并备份为 .json.bak）。\n\n{body}"
+        ))
     }
 }
 
-/// 把 `over` 合并进 `base`：对象递归合并，`over` 中缺失的键保留 `base` 的值。
-fn merge_missing(base: &mut serde_json::Value, over: &serde_json::Value) {
+/// 把 `over` 递归合并进 `base`：`over` 中缺失的键保留 `base` 的值（旧版 JSON 迁移用）。
+fn merge_json(base: &mut serde_json::Value, over: &serde_json::Value) {
     match (base, over) {
         (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
             for (k, v) in o {
                 match b.get_mut(k) {
-                    Some(slot) => merge_missing(slot, v),
+                    Some(slot) => merge_json(slot, v),
                     None => {
                         b.insert(k.clone(), v.clone());
                     }
@@ -210,7 +278,6 @@ fn merge_missing(base: &mut serde_json::Value, over: &serde_json::Value) {
         (slot, v) => *slot = v.clone(),
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,7 +285,7 @@ mod tests {
     #[test]
     fn roundtrip_and_defaults() {
         let dir = std::env::temp_dir().join(format!("pek-waf-cfg-{}", std::process::id()));
-        let file = dir.join("Config/Waf.json");
+        let file = dir.join(CONFIG_REL);
         let cfg = WafConfig::public_site();
         cfg.save(&file).unwrap();
         let loaded = WafConfig::load_or_create(&file).unwrap();
@@ -229,7 +296,7 @@ mod tests {
         assert_eq!(loaded.xss_action, Action::Monitor);
         assert_eq!(loaded.sensitive_prefixes, vec!["/admin".to_string()]);
         // 缺省字段容错（旧文件缺新字段）
-        std::fs::write(&file, r#"{ "enable": true }"#).unwrap();
+        std::fs::write(&file, "enable = true\n").unwrap();
         let partial = WafConfig::load_or_create(&file).unwrap();
         assert_eq!(partial.mode, WafMode::AdminApi); // 落回默认（admin_api）
         assert_eq!(partial.rate_limit_per_min, 300);
@@ -239,10 +306,10 @@ mod tests {
     #[test]
     fn file_missing_keys_inherit_preset() {
         let dir = std::env::temp_dir().join(format!("pek-waf-merge-{}", std::process::id()));
-        let file = dir.join("Waf.json");
+        let file = dir.join("Waf.toml");
         std::fs::create_dir_all(&dir).unwrap();
         // 旧文件：不含 skipBotPrefixes（模拟升级前生成）
-        std::fs::write(&file, r#"{ "enable": true, "blockMaliciousBots": true }"#).unwrap();
+        std::fs::write(&file, "enable = true\nblockMaliciousBots = true\n").unwrap();
 
         let mut preset = WafConfig::admin_api();
         preset.skip_bot_prefixes = vec!["/api".to_string()];
@@ -257,7 +324,7 @@ mod tests {
         assert_eq!(merged.skip_attack_prefixes, vec!["/api".to_string()]);
 
         // 文件里显式给出空数组时尊重文件（不继承预设）
-        std::fs::write(&file, r#"{ "skipBotPrefixes": [] }"#).unwrap();
+        std::fs::write(&file, "skipBotPrefixes = []\n").unwrap();
         let merged2 = WafConfig::load_merging(&file, &preset).unwrap();
         assert!(merged2.skip_bot_prefixes.is_empty());
 
@@ -265,12 +332,50 @@ mod tests {
     }
 
     #[test]
+    fn ruleset_survives_toml_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("pek-waf-rules-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join(CONFIG_REL);
+        let mut cfg = WafConfig::admin_api();
+        cfg.ruleset = Some(serde_json::from_str(r#"{
+            "Operator": "OrElse",
+            "Rules": [
+                { "MemberName": "Path", "Operator": "EndsWith", "Inputs": [".php", 42, true] }
+            ]
+        }"#).unwrap());
+        cfg.save(&file).expect("保存 TOML（含规则集）");
+        let loaded = WafConfig::load_merging(&file, &WafConfig::default()).expect("读回");
+        assert!(loaded.ruleset.is_some(), "规则集不能丢");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_json_is_migrated_to_toml() {
+        let dir = std::env::temp_dir().join(format!("pek-waf-mig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let legacy = dir.join(LEGACY_CONFIG_REL);
+        std::fs::create_dir_all(legacy.parent().expect("父目录")).expect("建目录");
+        std::fs::write(&legacy, r#"{ "enable": true, "rateLimitPerMin": 42 }"#).expect("写旧配置");
+        let file = dir.join(CONFIG_REL);
+        let cfg = WafConfig::load_or_create(&file).expect("加载/迁移");
+        assert!(cfg.enable);
+        assert_eq!(cfg.rate_limit_per_min, 42);
+        assert!(file.is_file(), "应生成 TOML");
+        assert!(!legacy.exists(), "旧 JSON 应改名");
+        assert!(legacy.with_extension("json.bak").is_file(), "旧文件应备份");
+        // 新文件能被再次读回（确认是合法 TOML）
+        let again = WafConfig::load_merging(&file, &WafConfig::default()).expect("读回 TOML");
+        assert_eq!(again.rate_limit_per_min, 42);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
     fn bad_json_reports_error() {
         let dir = std::env::temp_dir().join(format!("pek-waf-bad-{}", std::process::id()));
-        let file = dir.join("Waf.json");
+        let file = dir.join("Waf.toml");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(&file, "{ not json").unwrap();
+        std::fs::write(&file, "enable = = broken\n").unwrap();
         assert!(WafConfig::load_or_create(&file).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+

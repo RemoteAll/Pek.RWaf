@@ -1,4 +1,4 @@
-//! WAF 核心：`Waf` 门面（决策链）、dhrust 中间件装配、`Config/Waf.json` 热重载。
+//! WAF 核心：`Waf` 门面（决策链）、dhrust 中间件装配、`Config/Waf.toml` 热重载。
 //!
 //! 检查顺序（首个命中短路）：
 //! 1. 总开关 → 回环豁免 → IP 黑名单 → IP 白名单
@@ -9,7 +9,7 @@
 //!
 //! 接入方式（dhrust Router）：
 //! ```ignore
-//! let waf = pek_rwaf::Waf::load(&base);          // 读 {base}/Config/Waf.json（首启生成）
+//! let waf = pek_rwaf::Waf::load(&base);          // 读 {base}/Config/Waf.toml（首启生成）
 //! router.use_middleware(waf.middleware());        // 首行注册，全部路由生效
 //! ```
 
@@ -80,7 +80,7 @@ pub struct Waf {
     compiled_rules: RwLock<Vec<Compiled>>,
     limiter: RateLimiter,
     /// 可信业务请求签名密钥（DHDeploy 的 TimeStamp/Nonce/Signature 头；只存内存，
-    /// 不落 Config/Waf.json，面板保存配置不会把它清掉）
+    /// 不落 Config/Waf.toml，面板保存配置不会把它清掉）
     trusted_secret: RwLock<Option<String>>,
     /// 强制跳过机器人拦截的路径前缀（内存态：不落配置文件、面板保存也不会清掉）
     forced_skip_bot: RwLock<Vec<String>>,
@@ -114,24 +114,34 @@ impl Waf {
         Arc::new(waf)
     }
 
-    /// 从项目基础目录加载（`{base}/Config/Waf.json`；文件不存在时自动生成默认模板）。
+    /// 从项目基础目录加载（`{base}/Config/Waf.toml`；文件不存在时自动生成默认模板）。
     pub fn load(base: &Path) -> Arc<Self> {
         Self::load_with_default(base, WafConfig::default())
     }
 
     /// 同 [`Waf::load`]，但首启生成的模板使用指定预设（如前台站点用 [`WafConfig::public_site`]）。
     pub fn load_with_default(base: &Path, default: WafConfig) -> Arc<Self> {
-        let file = base.join("Config").join("Waf.json");
-        let config = if !file.exists() {
-            let _ = default.save(&file);
-            default.clone()
-        } else {
-            match WafConfig::load_merging(&file, &default) {
-                Ok(c) => c,
-                Err(e) => {
-                    dhrust::logs::log().warn(&format!("[WAF] 配置加载失败，使用默认策略：{e}"));
-                    default.clone()
+        let file = base.join(crate::config::CONFIG_REL);
+        if !file.exists() {
+            // ① 旧版 Config/Waf.json 优先迁移（升级场景）；② 否则按预设生成新配置
+            match WafConfig::migrate_legacy_json(&file, &default) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let _ = default.save(&file);
                 }
+                Err(e) => {
+                    dhrust::logs::log().warn(&format!(
+                        "[WAF] 旧版配置迁移失败：{e}（按预设生成新配置）"
+                    ));
+                    let _ = default.save(&file);
+                }
+            }
+        }
+        let config = match WafConfig::load_merging(&file, &default) {
+            Ok(c) => c,
+            Err(e) => {
+                dhrust::logs::log().warn(&format!("[WAF] 配置加载失败，使用默认策略：{e}"));
+                default.clone()
             }
         };
         let waf = Self {
@@ -910,7 +920,7 @@ mod tests {
     #[test]
     fn ip_lists_and_config_reload() {
         let dir = std::env::temp_dir().join(format!("pek-waf-mw-{}", std::process::id()));
-        let file = dir.join("Config").join("Waf.json");
+        let file = dir.join(crate::config::CONFIG_REL);
         {
             let mut cfg = WafConfig::public_site();
             cfg.ip_blacklist = vec!["8.8.8.0/24".to_string()];
@@ -956,7 +966,7 @@ mod tests {
     #[test]
     fn apply_config_takes_effect_and_persists() {
         let dir = std::env::temp_dir().join(format!("pek-waf-apply-{}", std::process::id()));
-        let file = dir.join("Config").join("Waf.json");
+        let file = dir.join(crate::config::CONFIG_REL);
         let waf = Waf::load_with_default(&dir, WafConfig::public_site());
         // 关闭 → 恶意 UA 也放行
         let mut cfg = waf.config();
@@ -982,9 +992,30 @@ mod tests {
     }
 
     #[test]
+    fn load_with_default_migrates_legacy_json() {
+        let dir = std::env::temp_dir().join(format!("pek-waf-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let legacy = dir.join(crate::config::LEGACY_CONFIG_REL);
+        std::fs::create_dir_all(legacy.parent().expect("父目录")).expect("建目录");
+        std::fs::write(&legacy, r#"{ "enable": true, "rateLimitPerMin": 42 }"#).expect("写旧配置");
+
+        let waf = Waf::load_with_default(&dir, WafConfig::public_site());
+        assert_eq!(waf.config().rate_limit_per_min, 42, "旧配置的值应生效");
+        assert_eq!(
+            waf.config().mode,
+            crate::config::WafMode::PublicSite,
+            "旧文件未写的键应继承调用方预设"
+        );
+        let file = dir.join(crate::config::CONFIG_REL);
+        assert!(file.is_file(), "应生成 Waf.toml");
+        assert!(!legacy.exists(), "旧 JSON 应改名");
+        assert!(legacy.with_extension("json.bak").is_file(), "旧文件应备份");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
     fn reload_recreates_missing_file_with_current_preset() {
         let dir = std::env::temp_dir().join(format!("pek-waf-reload-{}", std::process::id()));
-        let file = dir.join("Config").join("Waf.json");
+        let file = dir.join(crate::config::CONFIG_REL);
         let waf = Waf::load_with_default(&dir, WafConfig::public_site());
         assert_eq!(waf.config().mode, crate::config::WafMode::PublicSite);
         std::fs::remove_file(&file).unwrap();
@@ -1060,3 +1091,4 @@ mod tests {
         assert_eq!(waf.check(&r).blocked_status(), Some(403));
     }
 }
+
