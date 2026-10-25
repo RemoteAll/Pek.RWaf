@@ -906,10 +906,10 @@ impl Throttle {
             }
             Policy::UserIdentity => self.user_identity(ctx),
             Policy::Header => ctx.header(&valve.policy_key).map(str::to_string),
-            Policy::Query => ctx.query_value(&valve.policy_key).map(str::to_string),
+            Policy::Query => query_value(ctx, &valve.policy_key),
             Policy::RequestPath => Some(ctx.req.path.clone()),
             Policy::Cookie => cookie_value(ctx, &valve.policy_key),
-            Policy::Form => ctx.form_value(&valve.policy_key).map(str::to_string),
+            Policy::Form => form_value(ctx, &valve.policy_key),
         };
         value.filter(|v| !v.is_empty())
     }
@@ -1146,7 +1146,7 @@ fn counter_key(
     } else {
         Some(dhrust::sign::md5_short(&valve.policy_key))
     };
-    let value_hash = if value.is_empty() {
+    let value_hash = if value.trim().is_empty() {
         None
     } else {
         Some(dhrust::sign::md5_short(value))
@@ -1156,6 +1156,32 @@ fn counter_key(
         (None, Some(v)) => format!("{prefix}:rl:{policy}:{v}:{api}"),
         _ => format!("{prefix}:rl:{policy}:{api}"),
     }
+}
+
+fn query_value(ctx: &Ctx, name: &str) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
+    ctx.query_value(name)
+        .map(str::to_string)
+        .or_else(|| {
+            ctx.query
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.clone())
+        })
+}
+
+fn form_value(ctx: &Ctx, name: &str) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
+    ctx.form_value(name).map(str::to_string).or_else(|| {
+        ctx.form
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    })
 }
 
 fn cookie_value(ctx: &Ctx, name: &str) -> Option<String> {
