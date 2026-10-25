@@ -12,7 +12,7 @@ Pek 系列 Web 应用防火墙（Rust 公共库，crate `pek-rwaf`）——对�
 | --- | --- |
 | 🤖 爬虫分级 | 6 级分类：搜索引擎 / GEO-AI 抓取 / 社交预览（**放行**）；灰色 / 未知（记录+限速）；恶意爬虫与扫描器（**拦截**） |
 | 🧱 注入检测 | SQL 注入 / XSS / 路径穿越与敏感路径探测 / 命令注入；逐项动作（关/监控/拦截），双重 URL 解码防绕过 |
-| ⏱️ CC 限速 | 固定 60 秒窗口每 IP 计数；放行类机器人豁免；静态资源不计数 |
+| ⏱️ CC 限速 | 固定 60 秒窗口每 IP 计数（首次命中起，非自然分钟）；放行类机器人豁免；静态资源不计数 |
 | 🚦 接口级限流 | 对齐 C# `DH.RateLimter`：按「方法 + 路径」声明规则，IP / 用户 / Header / Query / Path / Cookie / Form 七种策略，多阀门优先级、`WhenNull`、429 多格式；计数引擎可替换为 Redis |
 | 🌐 跨站来源校验 | 浏览器**非安全方法**（POST/PUT/PATCH/DELETE）校验 `Sec-Fetch-Site`/`Origin`（CSRF 防护；**先于回环豁免**——localhost 面板免登录场景防恶意网页盲发）；无来源头（curl/服务间调用）放行 |
 | 📜 规则引擎 | **与 C# Pek.WAF 的 Ruleset JSON 格式兼容**（同一份规则可双端共用）+ 新增 `IsBotKind` |
@@ -217,6 +217,10 @@ returnType = "jsonDResult"
 
 ## 落地记录
 
+- 2026-10-25（二）**限流全面审计**：修复分片满 O(n) 扫描（改 O(1) 淘汰）、热路径分配、Query/Form 键名大小写、
+  空白值计数键、配置加载归一化、`guard` 规则深拷贝等；确认 WAF CC 窗口为「每 key 首次命中起 60 秒」。
+  详细报告：`docs/审计报告-限流能力-2026-10-25.md`。验证：dhrust 303/1 ignored、RWaf 55 lib + 2 集成（1 ignored）、
+  Linux x64/arm64 musl check 通过。
 - 2026-10-25 新增**接口级限流**（`throttle` 模块，对齐 C# `DH.RateLimter`）：七种策略、多阀门优先级、
   `WhenNull`、`Api-Throttle-Status`、429 多返回格式、`Config/Throttle.toml` 热重载、可注入 Redis 共享计数；
   通用固定窗口计数引擎下沉 `dhrust::ratelimit`，WAF 自身 CC 限流改为复用同一引擎（不再重复实现）。

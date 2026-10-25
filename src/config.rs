@@ -88,7 +88,7 @@ pub struct WafConfig {
     pub path_action: Action,
     /// 命令注入动作（默认仅记录）
     pub cmd_action: Action,
-    /// CC 限速（每 IP 每分钟请求数；0 = 关闭；放行类机器人豁免；静态资源不计数）
+    /// CC 限速（每 IP 首次命中起 60 秒窗口内的请求数；0 = 关闭；放行类机器人豁免；静态资源不计数）
     pub rate_limit_per_min: u32,
     /// 拦截日志
     pub log_blocked: bool,

@@ -24,6 +24,16 @@
 //! - C# 的 `Timestamp` 仅用于结果对象；本模块用 [`LimitInfo::retry_after`] 直接给出
 //!   `Retry-After` 所需秒数。
 //!
+//! # 安全与兼容提示
+//! - `trust_forwarded_for` 默认 **false**：只有反向代理会覆盖 `X-Forwarded-For`/`X-Real-IP`
+//!   时才开启，否则客户端可伪造来源绕过限流；
+//! - 与 C# 共享 Redis 计数时：`keyPrefix` 对齐 C# `RedisSetting.CacheKeyPrefix`，规则 `name`
+//!   对齐 C# `(DeclaringType.FullName + "." + Method).ToLower()`；策略键/值的 MD5 短哈希口径一致；
+//! - `set_limited_response` 自定义响应时由调用方自行设置 429 与 `Retry-After`/`Api-Throttle-Status`，
+//!   默认响应已包含这些头；
+//! - 计数键中的策略键/值使用 64 位 MD5 短哈希（与 C# 一致）；限流不是鉴权，哈希碰撞只可能导致
+//!   共享计数，不应把敏感信息直接放进 `policy_key`。
+//!
 //! # 接入方式
 //!
 //! ```no_run
@@ -284,7 +294,7 @@ impl RateValve {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ThrottleRule {
-    /// 规则名（用于计数键/日志；缺省用 `方法 路径`）
+    /// 规则名（用于计数键/日志；缺省用 `方法 路径`；**同名规则会共享计数键**）
     pub name: String,
     /// HTTP 方法（空或 `*` = 任意）
     pub method: String,
@@ -435,7 +445,15 @@ impl ThrottleConfig {
         };
         let cfg = dhrust::config::TomlConfig::<Self>::try_load_with(path, &template, opts)
             .map_err(|e| e.to_string())?;
-        Ok(cfg.into_value())
+        let mut cfg = cfg;
+        // 把迁移/缺键补齐/类型修正等提示写入日志，便于运维确认配置文件已自动维护
+        for note in cfg.take_notes() {
+            dhrust::logs::log().info(&format!("[RateLimiter] {note}"));
+        }
+        let mut cfg = cfg.into_value();
+        // 加载即按 priority 归一化，保证文件声明顺序不影响执行顺序
+        normalize_config(&mut cfg);
+        Ok(cfg)
     }
 
     /// 保存到 `path`（自动建目录；标量保留注释，`rules` 按数组表同步）。
@@ -699,7 +717,9 @@ impl Throttle {
         };
         if !file.exists() {
             let current = self.config();
-            let _ = current.save(&file);
+            if current.save(&file).is_ok() {
+                self.stamp_mtime(&file);
+            }
             return;
         }
         match ThrottleConfig::load_merging(&file, &self.preset) {
@@ -789,16 +809,36 @@ impl Throttle {
         if !cfg.enable {
             return ThrottleVerdict::Allow;
         }
-        let path_lower = ctx.req.path.to_ascii_lowercase();
-        if is_skipped(&cfg, &path_lower) {
+        if is_skipped(&cfg, &ctx.req.path) {
             return ThrottleVerdict::Allow;
         }
-        let ip = self.client_ip(ctx);
+        // 先判断是否有规则匹配，并判断是否需要 IP 数字：无关请求不解析 IP、不做任何哈希
+        let mut matched = false;
+        let mut needs_ip_numeric = false;
         for rule in &cfg.rules {
-            if !rule_matches(rule, &ctx.req.method, &path_lower) {
+            if rule_matches(rule, &ctx.req.method, &ctx.req.path) {
+                matched = true;
+                if rule.valves.iter().any(|valve| valve.policy == Policy::Ip) {
+                    needs_ip_numeric = true;
+                }
+            }
+        }
+        if !matched {
+            return ThrottleVerdict::Allow;
+        }
+        let ip = self.client_ip(ctx, cfg.trust_forwarded_for);
+        let ip_numeric = if needs_ip_numeric {
+            ip_to_numeric(&ip)
+        } else {
+            None
+        };
+        for rule in &cfg.rules {
+            if !rule_matches(rule, &ctx.req.method, &ctx.req.path) {
                 continue;
             }
-            if let Some(info) = self.check_rule(&cfg, rule, ctx, &ip) {
+            if let Some(info) =
+                self.check_rule(&cfg, rule, ctx, &ip, ip_numeric.as_deref())
+            {
                 return ThrottleVerdict::Limited(info);
             }
         }
@@ -816,15 +856,20 @@ impl Throttle {
         rule: &ThrottleRule,
         ctx: &Ctx,
         ip: &str,
+        ip_numeric: Option<&str>,
     ) -> Option<LimitInfo> {
+        // 每条规则只构建一次计数键前缀；API 名按需构建（全部阀门都跳过时不分配）
+        let prefix = key_prefix(cfg);
+        let mut api: Option<String> = None;
         for valve in &rule.valves {
             if !valve.is_effective() {
                 continue;
             }
-            let Some(value) = self.effective_value(ctx, valve, ip) else {
+            let Some(value) = self.effective_value(ctx, valve, ip, ip_numeric) else {
                 continue; // WhenNull::Pass：跳过当前阀门
             };
-            let key = counter_key(cfg, rule, valve, &value);
+            let api = api.get_or_insert_with(|| api_key(rule));
+            let key = counter_key(prefix, api, valve, &value);
             let decision = self
                 .limiter
                 .hit(&key, valve.limit, Duration::from_secs(valve.duration));
@@ -860,11 +905,11 @@ impl Throttle {
         None
     }
 
-    fn client_ip(&self, ctx: &Ctx) -> String {
+    fn client_ip(&self, ctx: &Ctx, trust_forwarded_for: bool) -> String {
         if let Some(f) = get_hook(&self.client_ip) {
             return f(ctx);
         }
-        if self.snapshot().trust_forwarded_for
+        if trust_forwarded_for
             && let Some(xff) = ctx
                 .header("x-forwarded-for")
                 .or_else(|| ctx.header("x-real-ip"))
@@ -894,16 +939,14 @@ impl Throttle {
         None
     }
 
-    fn policy_value(&self, ctx: &Ctx, valve: &RateValve, ip: &str) -> Option<String> {
+    fn policy_value(
+        &self,
+        ctx: &Ctx,
+        valve: &RateValve,
+        ip_numeric: Option<&str>,
+    ) -> Option<String> {
         let value = match valve.policy {
-            Policy::Ip => {
-                if ip.is_empty() || ip.eq_ignore_ascii_case("unknown") {
-                    None
-                } else {
-                    // 对齐 C#：IP 无效（无法转数字）视为空值，交给 WhenNull 处理
-                    dhrust::net::ip_to_num(ip)
-                }
-            }
+            Policy::Ip => ip_numeric.map(str::to_string),
             Policy::UserIdentity => self.user_identity(ctx),
             Policy::Header => ctx.header(&valve.policy_key).map(str::to_string),
             Policy::Query => query_value(ctx, &valve.policy_key),
@@ -914,8 +957,14 @@ impl Throttle {
         value.filter(|v| !v.is_empty())
     }
 
-    fn effective_value(&self, ctx: &Ctx, valve: &RateValve, ip: &str) -> Option<String> {
-        if let Some(value) = self.policy_value(ctx, valve, ip) {
+    fn effective_value(
+        &self,
+        ctx: &Ctx,
+        valve: &RateValve,
+        ip: &str,
+        ip_numeric: Option<&str>,
+    ) -> Option<String> {
+        if let Some(value) = self.policy_value(ctx, valve, ip_numeric) {
             return Some(value);
         }
         match valve.when_null {
@@ -993,23 +1042,29 @@ impl Throttle {
         let engine = Arc::clone(self);
         let mut rule = rule;
         normalize_rule(&mut rule);
+        // 规则按 Arc 共享，避免 guard 每个请求深拷贝阀门列表
+        let rule = Arc::new(rule);
         route(move |mut ctx: Ctx| {
             let engine = Arc::clone(&engine);
-            let rule = rule.clone();
+            let rule = Arc::clone(&rule);
             let handler = Arc::clone(&handler);
             async move {
                 engine.maybe_reload();
                 let cfg = engine.snapshot();
-                let path_lower = ctx.req.path.to_ascii_lowercase();
                 let skip = !cfg.enable
                     || !rule.enable
-                    || !rule_matches(&rule, &ctx.req.method, &path_lower)
-                    || is_skipped(&cfg, &path_lower);
+                    || !rule_matches(&rule, &ctx.req.method, &ctx.req.path)
+                    || is_skipped(&cfg, &ctx.req.path);
                 if skip {
                     return handler(ctx).await;
                 }
-                let ip = engine.client_ip(&ctx);
-                match engine.check_rule(&cfg, &rule, &ctx, &ip) {
+                let ip = engine.client_ip(&ctx, cfg.trust_forwarded_for);
+                let ip_numeric = if rule.valves.iter().any(|valve| valve.policy == Policy::Ip) {
+                    ip_to_numeric(&ip)
+                } else {
+                    None
+                };
+                match engine.check_rule(&cfg, &rule, &ctx, &ip, ip_numeric.as_deref()) {
                     None => {
                         set_header(&mut ctx.req.headers, HEADER_STATUS, "1");
                         let mut outcome = handler(ctx).await;
@@ -1060,14 +1115,20 @@ fn normalize_rule(rule: &mut ThrottleRule) {
         .sort_by_key(|valve| std::cmp::Reverse(valve.priority));
 }
 
-fn is_skipped(cfg: &ThrottleConfig, path_lower: &str) -> bool {
+fn is_skipped(cfg: &ThrottleConfig, path: &str) -> bool {
     cfg.skip_paths.iter().any(|p| {
         let p = p.trim();
-        !p.is_empty() && path_lower.starts_with(&p.to_ascii_lowercase())
+        !p.is_empty() && starts_with_ignore_ascii_case(path, p)
     })
 }
 
-fn rule_matches(rule: &ThrottleRule, method: &str, path_lower: &str) -> bool {
+/// ASCII 大小写不敏感前缀判断（按字节比较，不分配临时字符串）。
+fn starts_with_ignore_ascii_case(text: &str, prefix: &str) -> bool {
+    text.len() >= prefix.len()
+        && text.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
+fn rule_matches(rule: &ThrottleRule, method: &str, path: &str) -> bool {
     if !rule.enable {
         return false;
     }
@@ -1078,30 +1139,30 @@ fn rule_matches(rule: &ThrottleRule, method: &str, path_lower: &str) -> bool {
     {
         return false;
     }
-    path_matches(&rule.path, path_lower)
+    path_matches(&rule.path, path)
 }
 
-fn path_matches(pattern: &str, path_lower: &str) -> bool {
+fn path_matches(pattern: &str, path: &str) -> bool {
     let pattern = pattern.trim();
     if pattern.is_empty() || pattern == "*" {
         return true;
     }
-    let pattern = pattern.to_ascii_lowercase();
     if let Some(prefix) = pattern.strip_suffix('*') {
-        return path_lower.starts_with(prefix);
+        return starts_with_ignore_ascii_case(path, prefix);
     }
     if pattern.contains('{') {
-        let pats: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
-        let segs: Vec<&str> = path_lower.split('/').filter(|s| !s.is_empty()).collect();
-        if pats.len() != segs.len() {
-            return false;
+        // 迭代比较，不分配 Vec（热路径）
+        let mut pats = pattern.split('/').filter(|s| !s.is_empty());
+        let mut segs = path.split('/').filter(|s| !s.is_empty());
+        loop {
+            match (pats.next(), segs.next()) {
+                (None, None) => return true,
+                (Some(pat), Some(seg)) if is_param(pat) || pat.eq_ignore_ascii_case(seg) => {}
+                _ => return false,
+            }
         }
-        return pats
-            .iter()
-            .zip(segs.iter())
-            .all(|(pat, seg)| is_param(pat) || pat == seg);
     }
-    pattern == path_lower
+    pattern.eq_ignore_ascii_case(path)
 }
 
 fn is_param(segment: &str) -> bool {
@@ -1120,13 +1181,9 @@ fn display_rule(rule: &ThrottleRule) -> String {
     GLOBAL_API_KEY.to_string()
 }
 
-fn counter_key(
-    cfg: &ThrottleConfig,
-    rule: &ThrottleRule,
-    valve: &RateValve,
-    value: &str,
-) -> String {
-    let api = if !rule.name.trim().is_empty() {
+/// 计数键中的 API 标识（一次构建，避免多阀门重复分配）。
+fn api_key(rule: &ThrottleRule) -> String {
+    if !rule.name.trim().is_empty() {
         rule.name.trim().to_ascii_lowercase()
     } else if !rule.path.trim().is_empty() {
         format!("{} {}", rule.method.trim(), rule.path.trim())
@@ -1134,12 +1191,15 @@ fn counter_key(
             .to_ascii_lowercase()
     } else {
         GLOBAL_API_KEY.to_string()
-    };
-    let prefix = if cfg.key_prefix.trim().is_empty() {
-        "dh"
-    } else {
-        cfg.key_prefix.trim()
-    };
+    }
+}
+
+fn key_prefix(cfg: &ThrottleConfig) -> &str {
+    let prefix = cfg.key_prefix.trim();
+    if prefix.is_empty() { "dh" } else { prefix }
+}
+
+fn counter_key(prefix: &str, api: &str, valve: &RateValve, value: &str) -> String {
     let policy = valve.policy.as_key();
     let key_hash = if valve.policy_key.trim().is_empty() {
         None
@@ -1155,6 +1215,15 @@ fn counter_key(
         (Some(k), Some(v)) => format!("{prefix}:rl:{policy}:{k}:{v}:{api}"),
         (None, Some(v)) => format!("{prefix}:rl:{policy}:{v}:{api}"),
         _ => format!("{prefix}:rl:{policy}:{api}"),
+    }
+}
+
+/// IP → 计数用十进制数字（无效/unknown 返回 `None`，交给 `WhenNull`）。
+fn ip_to_numeric(ip: &str) -> Option<String> {
+    if ip.is_empty() || ip.eq_ignore_ascii_case("unknown") {
+        None
+    } else {
+        dhrust::net::ip_to_num(ip)
     }
 }
 
@@ -1325,17 +1394,18 @@ mod tests {
     #[test]
     fn method_and_path_matching() {
         assert!(path_matches("/api/login", "/api/login"));
+        assert!(path_matches("/API/Login", "/api/login"));
         assert!(!path_matches("/api/login", "/api/login2"));
-        assert!(path_matches("/api/admin/*", "/api/admin/logs"));
+        assert!(path_matches("/api/admin/*", "/API/ADMIN/logs"));
         assert!(!path_matches("/api/admin/*", "/api/admin"));
-        assert!(path_matches("/api/users/{id}", "/api/users/42"));
+        assert!(path_matches("/api/users/{id}", "/API/Users/42"));
         assert!(!path_matches("/api/users/{id}", "/api/users/42/orders"));
         assert!(path_matches("", "/anything"));
         assert!(path_matches("*", "/anything"));
 
         let rule = ThrottleRule::new("POST", "/api/login", vec![RateValve::ip(1, 60)]);
         assert!(!rule_matches(&rule, "GET", "/api/login"));
-        assert!(rule_matches(&rule, "post", "/api/login"));
+        assert!(rule_matches(&rule, "post", "/API/LOGIN"));
         assert!(!rule_matches(&rule, "POST", "/api/logout"));
         assert!(!rule_matches(&rule.clone().enabled(false), "POST", "/api/login"));
     }
@@ -1438,6 +1508,12 @@ mod tests {
                 .is_allow()
         );
         assert!(
+            !query
+                .check(&make_ctx("GET", "/api/query?API_KEY=a", &[], "", "6.6.6.6"))
+                .is_allow(),
+            "Query 键名应大小写不敏感"
+        );
+        assert!(
             query
                 .check(&make_ctx("GET", "/api/query?api_key=b", &[], "", "6.6.6.6"))
                 .is_allow(),
@@ -1493,6 +1569,12 @@ mod tests {
             !form
                 .check(&make_ctx("POST", "/api/form", &[], "uid=u1", "7.7.7.7"))
                 .is_allow()
+        );
+        assert!(
+            !form
+                .check(&make_ctx("POST", "/api/form", &[], "UID=u1", "7.7.7.7"))
+                .is_allow(),
+            "Form 键名应大小写不敏感"
         );
 
         // RequestPath：规则路径用前缀匹配多个路径，计数按实际路径区分
@@ -1638,7 +1720,10 @@ mod tests {
             rules: vec![ThrottleRule::new(
                 "POST",
                 "/api/login",
-                vec![RateValve::ip(3, 120).priority(2)],
+                vec![
+                    RateValve::ip(3, 120).priority(2),
+                    RateValve::header("X-Api-Key", 100, 3600).priority(5),
+                ],
             )],
             ..ThrottleConfig::default()
         };
@@ -1651,8 +1736,10 @@ mod tests {
             ThrottleConfig::load_merging(&file, &ThrottleConfig::default()).expect("加载配置");
         assert_eq!(loaded.key_prefix, "test");
         assert_eq!(loaded.rules.len(), 1);
-        assert_eq!(loaded.rules[0].valves[0].limit, 3);
-        assert_eq!(loaded.rules[0].valves[0].duration, 120);
+        assert_eq!(loaded.rules[0].valves.len(), 2);
+        assert_eq!(loaded.rules[0].valves[0].policy, Policy::Header, "高优先级阀门应在前");
+        assert_eq!(loaded.rules[0].valves[1].limit, 3);
+        assert_eq!(loaded.rules[0].valves[1].duration, 120);
 
         let throttle = Throttle::load(&dir);
         let c = || make_ctx("POST", "/api/login", &[], "", "2.2.2.2");
@@ -1661,9 +1748,9 @@ mod tests {
         }
         assert!(!throttle.check(&c()).is_allow());
 
-        // 外部改小 limit → reload 后立即生效，且计数清零
+        // 外部改小 IP 阀门 limit → reload 后立即生效，且计数清零
         let mut changed = loaded.clone();
-        changed.rules[0].valves[0].limit = 1;
+        changed.rules[0].valves[1].limit = 1;
         changed.save(&file).expect("改配置");
         throttle.reload();
         assert!(throttle.check(&c()).is_allow(), "重载后计数应清零");
@@ -1687,10 +1774,10 @@ mod tests {
         assert!(throttle.check(&c()).is_allow(), "应用配置后计数应清零");
 
         let mut cfg = throttle.config();
-        cfg.skip_paths = vec!["/api/apply".to_string()];
+        cfg.skip_paths = vec!["/API/APPLY".to_string()];
         throttle.apply_config(cfg).expect("应用跳过配置");
         for _ in 0..5 {
-            assert!(throttle.check(&c()).is_allow(), "skipPaths 应跳过");
+            assert!(throttle.check(&c()).is_allow(), "skipPaths 应大小写不敏感");
         }
     }
 
@@ -1713,6 +1800,117 @@ mod tests {
         assert!(!legacy.exists(), "旧 JSON 应改名");
         assert!(legacy.with_extension("json.bak").is_file(), "旧文件应备份");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zero_limit_or_duration_valve_is_skipped() {
+        let throttle = Throttle::with_rules(vec![ThrottleRule::new(
+            "GET",
+            "/api/off-valve",
+            vec![RateValve::ip(0, 60), RateValve::ip(1, 0)],
+        )]);
+        for _ in 0..5 {
+            assert!(
+                throttle
+                    .check(&make_ctx("GET", "/api/off-valve", &[], "", "1.1.1.1"))
+                    .is_allow(),
+                "limit=0 / duration=0 的阀门应跳过"
+            );
+        }
+    }
+
+    #[test]
+    fn trust_forwarded_for_controls_client_ip_source() {
+        let rule = ThrottleRule::new("GET", "/api/xff", vec![RateValve::ip(1, 60)]);
+        let ctx = |xff: &str| {
+            make_ctx(
+                "GET",
+                "/api/xff",
+                &[("X-Forwarded-For", xff)],
+                "",
+                "1.1.1.1",
+            )
+        };
+
+        // 默认不信任 XFF：不同 XFF 仍共享同一远端 IP 计数
+        let untrusted = Throttle::with_rules(vec![rule.clone()]);
+        assert!(untrusted.check(&ctx("2.2.2.2")).is_allow());
+        assert!(
+            !untrusted.check(&ctx("3.3.3.3")).is_allow(),
+            "默认不信任 X-Forwarded-For"
+        );
+
+        // 显式信任后按 XFF 独立计数
+        let trusted = Throttle::with_config(ThrottleConfig {
+            trust_forwarded_for: true,
+            rules: vec![rule],
+            ..ThrottleConfig::default()
+        });
+        assert!(trusted.check(&ctx("2.2.2.2")).is_allow());
+        assert!(trusted.check(&ctx("3.3.3.3")).is_allow());
+        assert!(!trusted.check(&ctx("2.2.2.2")).is_allow());
+    }
+
+    #[test]
+    fn invalid_ip_uses_when_null_intercept() {
+        let throttle = Throttle::with_rules(vec![ThrottleRule::new(
+            "GET",
+            "/api/invalid-ip",
+            vec![RateValve::ip(1, 60).when_null(WhenNull::Intercept)],
+        )]);
+        let c = || make_ctx("GET", "/api/invalid-ip", &[], "", "not-an-ip");
+        assert!(throttle.check(&c()).is_allow());
+        assert!(
+            !throttle.check(&c()).is_allow(),
+            "无效 IP 应按空值标识继续限流"
+        );
+    }
+
+    #[test]
+    fn whitespace_header_value_shares_counter() {
+        let throttle = Throttle::with_rules(vec![ThrottleRule::new(
+            "GET",
+            "/api/space",
+            vec![RateValve::header("X-Key", 1, 60)],
+        )]);
+        let c = || {
+            make_ctx(
+                "GET",
+                "/api/space",
+                &[("X-Key", "   ")],
+                "",
+                "4.4.4.4",
+            )
+        };
+        assert!(throttle.check(&c()).is_allow());
+        assert!(
+            !throttle.check(&c()).is_allow(),
+            "空白值应按 C# IsNullOrWhiteSpace 口径省略值段"
+        );
+    }
+
+    #[test]
+    fn custom_client_ip_hook_overrides_remote_addr() {
+        let throttle = Throttle::with_rules(vec![ThrottleRule::new(
+            "GET",
+            "/api/hook",
+            vec![RateValve::ip(1, 60)],
+        )]);
+        throttle.set_client_ip(|ctx| {
+            ctx.header("X-Real-IP").unwrap_or("unknown").to_string()
+        });
+        let c = |ip: &str| {
+            make_ctx(
+                "GET",
+                "/api/hook",
+                &[("X-Real-IP", ip)],
+                "",
+                "9.9.9.9",
+            )
+        };
+        assert!(throttle.check(&c("1.1.1.1")).is_allow());
+        assert!(!throttle.check(&c("1.1.1.1")).is_allow());
+        assert!(throttle.check(&c("2.2.2.2")).is_allow());
     }
 
     #[test]
