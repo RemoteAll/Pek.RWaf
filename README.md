@@ -1,7 +1,7 @@
 ﻿# Pek.RWaf
 
 Pek 系列 Web 应用防火墙（Rust 公共库，crate `pek-rwaf`）——对齐 C# [`Pek.WAF`](../Pek.FrameWork/Pek.WAF) 的功能并扩展
-「爬虫分级治理」与「CC 限速」，同时提供对齐 C# [`DH.RateLimter`](../Pek.FrameWork/DH.RateLimter) 的
+「爬虫分级治理」与「CC 限速」，同时提供对齐 C# `G:\Code\Pek.FrameWork\DH.RateLimter` 的
 **接口级多策略限流**，以 [dhrust](../DH.RustBase) 中间件形式接入任意 HTTP 服务。
 
 消费方：**Pek.RCard**（前台公开站点）、**Pek.RAgent / Pek.RPanlServer / DHDeploy.Agent.Rust**（管理端）。
