@@ -1,19 +1,22 @@
 //! CC（Challenge Collapsar）限速：固定 60 秒窗口的每 IP 请求计数。
+//!
+//! 计数引擎已下沉 [`dhrust::ratelimit`]（与接口级限流 [`crate::throttle`] 共用）；
+//! 本模块只保留 WAF 的 CC 语义：每个 IP 每分钟固定上限，超限返回 429。
 
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+
+use dhrust::ratelimit::WindowLimiter;
 
 /// 固定窗口限速器（每 key 每分钟 N 次；0 = 关闭由调用方判断）。
 pub struct RateLimiter {
-    inner: Mutex<HashMap<String, (i64, u32)>>,
+    inner: WindowLimiter,
 }
 
 impl RateLimiter {
     /// 新建空限速器。
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: WindowLimiter::new(),
         }
     }
 
@@ -22,38 +25,14 @@ impl RateLimiter {
         if per_minute == 0 {
             return true;
         }
-        let window = now_secs() / 60;
-        let mut map = match self.inner.lock() {
-            Ok(m) => m,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        // 防泄漏：键过多时清理过期窗口
-        if map.len() > 4096 {
-            map.retain(|_, (w, _)| *w == window);
-        }
-        match map.get_mut(key) {
-            Some((w, count)) => {
-                if *w != window {
-                    *w = window;
-                    *count = 1;
-                    true
-                } else {
-                    *count += 1;
-                    *count <= per_minute
-                }
-            }
-            None => {
-                map.insert(key.to_string(), (window, 1));
-                true
-            }
-        }
+        self.inner
+            .hit(key, u64::from(per_minute), Duration::from_secs(60))
+            .allowed
     }
 
     /// 清空全部计数（热重载时调用）。
     pub fn clear(&self) {
-        if let Ok(mut m) = self.inner.lock() {
-            m.clear();
-        }
+        self.inner.clear();
     }
 }
 
@@ -61,13 +40,6 @@ impl Default for RateLimiter {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

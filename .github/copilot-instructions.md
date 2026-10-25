@@ -11,5 +11,7 @@
 
 - **本仓库是库 crate（lib），无独立二进制**：对外只暴露 `pek_rwaf::{Waf, WafConfig, ...}`，由宿主服务以中间件方式接入。
 - 兼容口径：规则集与 C# `Pek.WAF` 的 `Ruleset` 格式互通（同一份规则文件可双端共用），在此之上新增 `IsBotKind` 操作符。
+- **限流只有一套引擎**：WAF CC（`ratelimit.rs`）与接口级限流（`throttle.rs`，对齐 C# `DH.RateLimter`）都复用 `dhrust::ratelimit`；
+  不要在库内再新增 `Mutex<HashMap>` 计数实现；需要共享计数时实现 `CounterStore`（如 Redis）并注入。
 - 改动后必须覆盖三端：`Pek.RPanlServer`、`HLZX.EIP`（以及任何 `route.use_middleware(waf.middleware())` 的宿主）。
 - 构建/测试用 `cargo check` / `cargo test`；本机日常编译用 `cargo build --profile fast`，发版才用 `--release`（thin LTO）。

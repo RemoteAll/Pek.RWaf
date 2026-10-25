@@ -1,7 +1,8 @@
 ﻿# Pek.RWaf
 
 Pek 系列 Web 应用防火墙（Rust 公共库，crate `pek-rwaf`）——对齐 C# [`Pek.WAF`](../Pek.FrameWork/Pek.WAF) 的功能并扩展
-「爬虫分级治理」与「CC 限速」，以 [dhrust](../DH.RustBase) 中间件形式接入任意 HTTP 服务。
+「爬虫分级治理」与「CC 限速」，同时提供对齐 C# [`DH.RateLimter`](../Pek.FrameWork/DH.RateLimter) 的
+**接口级多策略限流**，以 [dhrust](../DH.RustBase) 中间件形式接入任意 HTTP 服务。
 
 消费方：**Pek.RCard**（前台公开站点）、**Pek.RAgent / Pek.RPanlServer / DHDeploy.Agent.Rust**（管理端）。
 
@@ -12,6 +13,7 @@ Pek 系列 Web 应用防火墙（Rust 公共库，crate `pek-rwaf`）——对�
 | 🤖 爬虫分级 | 6 级分类：搜索引擎 / GEO-AI 抓取 / 社交预览（**放行**）；灰色 / 未知（记录+限速）；恶意爬虫与扫描器（**拦截**） |
 | 🧱 注入检测 | SQL 注入 / XSS / 路径穿越与敏感路径探测 / 命令注入；逐项动作（关/监控/拦截），双重 URL 解码防绕过 |
 | ⏱️ CC 限速 | 固定 60 秒窗口每 IP 计数；放行类机器人豁免；静态资源不计数 |
+| 🚦 接口级限流 | 对齐 C# `DH.RateLimter`：按「方法 + 路径」声明规则，IP / 用户 / Header / Query / Path / Cookie / Form 七种策略，多阀门优先级、`WhenNull`、429 多格式；计数引擎可替换为 Redis |
 | 🌐 跨站来源校验 | 浏览器**非安全方法**（POST/PUT/PATCH/DELETE）校验 `Sec-Fetch-Site`/`Origin`（CSRF 防护；**先于回环豁免**——localhost 面板免登录场景防恶意网页盲发）；无来源头（curl/服务间调用）放行 |
 | 📜 规则引擎 | **与 C# Pek.WAF 的 Ruleset JSON 格式兼容**（同一份规则可双端共用）+ 新增 `IsBotKind` |
 | 🚫 IP 名单 | 白名单（优先放行）/ 黑名单；精确、CIDR（`10.0.0.0/8`）、通配符（`192.168.*.*`）、文件 |
@@ -118,6 +120,82 @@ router.use_middleware(waf.middleware());
 - `IsBotKind` 目标值：`SearchEngine` / `AiCrawler` / `SocialPreview` / `Monitor` / `Malicious` / `Unknown` / `Any` / `friendly`。
 - 说明：`IpCountry` 需外部 GeoIP 数据（未内置，恒不命中）；`IpInFile` 相对 `Config/` 所属基础目录解析。
 
+## 接口级限流（对齐 C# DH.RateLimter）
+
+WAF 的 `rateLimitPerMin` 是**全站每 IP** 的 CC 防护；本模块是**按接口/多策略**的业务限流，两者可同时启用：
+
+```rust
+use std::path::Path;
+
+// 1. 加载规则（{base}/Config/Throttle.toml；首启自动生成，改动 ≤10 秒热生效）
+let throttle = pek_rwaf::Throttle::load(Path::new("."));
+
+// 2. 全局中间件（WAF 放最外层，限流放其后）
+router.use_middleware(waf.middleware());
+router.use_middleware(throttle.middleware());
+
+// 3. 或按路由包裹（规则写在代码里）
+let rule = pek_rwaf::ThrottleRule::new(
+    "POST",
+    "/api/auth/login",
+    vec![pek_rwaf::RateValve::ip(5, 60)],
+);
+router.map_post("/api/auth/login", throttle.guard(rule, login_handler));
+```
+
+`Config/Throttle.toml` 示例（多阀门按 `priority` 从高到低执行）：
+
+```toml
+enable = true
+keyPrefix = "dh"
+logBlocked = true
+trustForwardedFor = false
+skipPaths = ["/assets/"]
+rules = []
+
+[[rules]]
+name = "POST /api/auth/login"
+method = "POST"
+path = "/api/auth/login"
+
+[[rules.valves]]
+policy = "ip"          # ip / userIdentity / header / query / requestPath / cookie / form
+limit = 5
+duration = 60          # 秒
+whenNull = "pass"      # pass / intercept
+priority = 1
+returnType = "jsonDResult"   # jsonDResult / jsonDgResult / text
+
+[[rules.valves]]
+policy = "header"
+policyKey = "X-Api-Key"
+limit = 100
+duration = 3600
+whenNull = "intercept"
+priority = 2
+returnType = "jsonDResult"
+```
+
+| C# `DH.RateLimter` | `pek_rwaf::throttle` |
+| --- | --- |
+| `[RateValve]` 特性（可多个，Priority 降序） | `ThrottleRule.valves`（按 `priority` 降序） |
+| `Policy`：Ip / UserIdentity / Header / Query / RequestPath / Cookie / Form | `Policy`（同名七种） |
+| `WhenNull.Pass` / `Intercept` | `WhenNull`（空值跳过 / 按客户端 IP 生成空值标识） |
+| `IRateLimitStore<T>.IncrementAsync`（Redis/内存） | `dhrust::ratelimit::CounterStore`（默认进程内，可注入 Redis） |
+| `ReturnType`：`Json_DGResult` / `Json_DResult` / `Text` | `ThrottleReturnType`（429 + 对应响应体） |
+| 请求头 `Api-Throttle-Status: 1/0` | 同名请求头 + 响应头 |
+| `AllowRateLimter` | `ThrottleConfig.enable` |
+| `OnUserIdentity` / `OnIpAddress` / `onIntercepted` | `set_user_identity` / `set_client_ip` / `set_limited_response` |
+
+**差异（有意为之）**：
+
+- Rust 无运行时特性/反射：规则改为 TOML 表或 `Throttle::guard(rule, handler)` 包裹；
+- C# 的 MD5 / IP 转换有 5 分钟内存缓存；Rust 单次计算在百纳秒级，直接计算，避免无界缓存；
+- C# 的黑白名单未实现（源码注释明确），本模块不做——IP 名单由 WAF 负责；
+- `UserIdentity` 默认读取 `Ctx.state` 的 `user_id` / `userId` / `userid` / `user` / `username` / `sub`，
+  宿主接入 JWT/会话后把用户写入 `Ctx.state` 即可；也可用 `set_user_identity` 自定义；
+- `Form` 策略支持 `application/x-www-form-urlencoded`（`Ctx` 已解析）；multipart 尚未解析。
+
 ## 配置参考（`Config/Waf.toml`，camelCase）
 
 | 字段 | 默认（admin_api） | 说明 |
@@ -139,6 +217,10 @@ router.use_middleware(waf.middleware());
 
 ## 落地记录
 
+- 2026-10-25 新增**接口级限流**（`throttle` 模块，对齐 C# `DH.RateLimter`）：七种策略、多阀门优先级、
+  `WhenNull`、`Api-Throttle-Status`、429 多返回格式、`Config/Throttle.toml` 热重载、可注入 Redis 共享计数；
+  通用固定窗口计数引擎下沉 `dhrust::ratelimit`，WAF 自身 CC 限流改为复用同一引擎（不再重复实现）。
+  验证：`cargo test` **49 lib + 2 集成**全绿，`cargo clippy --all-targets -- -D warnings` 零告警。
 - 2026-10-23 配置改 TOML：`Config/Waf.json` → **`Config/Waf.toml`**（可写注释），旧文件自动迁移并备份为
   `.json.bak`（迁移由 `dhrust::config::TomlConfig<T>` 自动完成：缺失键继承调用方预设，本库不写迁移代码）；读写委托 `dhrust::config::TomlConfig<T>`
   （缺失生成/缺键带注释补齐/类型容错/损坏备份重建），本库不再自实现配置管线。35 单测全绿。

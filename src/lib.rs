@@ -8,6 +8,9 @@
 //!   sleep()/benchmark()、information_schema、xp_cmdshell 等）；与「数据访问统一走 Pek.RCode 参数化 ORM」
 //!   形成纵深防御（外围 WAF + 内层 ORM）；
 //! - **CC 防护**（[`ratelimit`]）：按 IP 固定窗口限速（搜索引擎/GEO 白名单如常爬行不受限）；
+//! - **接口级限流**（[`throttle`]）：对齐 C# `DH.RateLimter`——按「方法 + 路径」声明规则，
+//!   支持 IP/用户/Header/Query/Path/Cookie/Form 七种策略、多阀门优先级、`WhenNull`、
+//!   429 多种返回格式；计数引擎下沉 [`dhrust::ratelimit`]（可替换 Redis 共享计数）；
 //! - **自定义规则**（[`rules`]）：JSON 规则集，**与 C# Pek.WAF 的 Ruleset 格式兼容**（同一份规则文件可双端共用），
 //!   在 C# 操作符全集之上新增 `IsBotKind`（按爬虫分类命中）；
 //! - **dhrust 接入**（[`middleware`]）：`router.use_middleware(waf.middleware())` 一行接入洋葱链；
@@ -31,8 +34,10 @@ pub mod config;
 pub mod middleware;
 pub mod ratelimit;
 pub mod rules;
+pub mod throttle;
 pub mod wafreq;
 
 pub use config::{WafConfig, WafMode};
 pub use middleware::{Verdict, Waf};
+pub use throttle::{RateValve, Throttle, ThrottleConfig, ThrottleRule, ThrottleVerdict, WhenNull};
 pub use wafreq::WafRequest;
