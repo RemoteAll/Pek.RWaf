@@ -94,6 +94,13 @@ pub struct WafConfig {
     pub log_blocked: bool,
     /// 详细日志（记录放行/监控命中）
     pub verbose: bool,
+    /// 请求体扫描上限（字节；默认 64 KB）：只扫前 N 字节，防大 body 造成 CPU 开销；
+    /// 设为 0 时回退到 16 KB 保守值
+    pub body_scan_limit: usize,
+    /// 对**非文本** Content-Type 的请求体也做扫描（lossy 转文本）。
+    /// 默认关（图片/二进制上传易误报）；本项目这类「只有 JSON/表单」的服务应打开，
+    /// 否则攻击者改个 `Content-Type: application/octet-stream` 就能绕过 body 检测
+    pub body_scan_all_types: bool,
     /// 自定义规则集（C# Pek.WAF 兼容 JSON；命中即拦截）
     pub ruleset: Option<Rule>,
 }
@@ -132,6 +139,8 @@ impl WafConfig {
             rate_limit_per_min: 600,
             log_blocked: true,
             verbose: false,
+            body_scan_limit: 64 * 1024,
+            body_scan_all_types: false,
             ruleset: None,
         }
     }
@@ -162,6 +171,8 @@ impl WafConfig {
             rate_limit_per_min: 300,
             log_blocked: true,
             verbose: false,
+            body_scan_limit: 64 * 1024,
+            body_scan_all_types: true,
             ruleset: None,
         }
     }

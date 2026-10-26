@@ -26,11 +26,7 @@ impl WafRequest {
     pub fn from_http(req: &HttpRequest) -> Self {
         let user_agent = req.header("user-agent").unwrap_or("").to_string();
         let content_type = req.header("content-type").unwrap_or("").to_string();
-        let body_text = if content_type.starts_with("text/")
-            || content_type.contains("json")
-            || content_type.contains("x-www-form-urlencoded")
-            || content_type.contains("xml")
-        {
+        let body_text = if is_text_content_type(&content_type) {
             let cap = req.body.len().min(16 * 1024);
             String::from_utf8_lossy(&req.body[..cap]).to_string()
         } else {
@@ -77,6 +73,14 @@ impl WafRequest {
             _ => "",
         }
     }
+}
+
+/// 请求体是否为「文本类」内容（可安全按 UTF-8 扫描）。
+pub fn is_text_content_type(content_type: &str) -> bool {
+    content_type.starts_with("text/")
+        || content_type.contains("json")
+        || content_type.contains("x-www-form-urlencoded")
+        || content_type.contains("xml")
 }
 
 /// 剥离 `IP:Port` 中的端口（兼容 `[::1]:123` 形态；无端口原样返回）。

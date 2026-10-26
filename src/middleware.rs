@@ -431,6 +431,23 @@ impl Waf {
             return Verdict::Allow;
         }
         let mut wreq = WafRequest::from_http(req);
+        // body 扫描范围按配置：默认只扫文本类的前 16 KB；`body_scan_all_types` 打开后
+        // 连 `application/octet-stream` 也扫（防「改个 Content-Type 就绕过 body 检测」），
+        // 上限由 `body_scan_limit` 控制（防大 body 造成 CPU 开销）。
+        let (limit, all_types) = match self.config.read() {
+            Ok(c) => (c.body_scan_limit, c.body_scan_all_types),
+            Err(p) => {
+                let c = p.into_inner();
+                (c.body_scan_limit, c.body_scan_all_types)
+            }
+        };
+        let limit = if limit == 0 { 16 * 1024 } else { limit };
+        if !req.body.is_empty()
+            && (all_types || crate::wafreq::is_text_content_type(&wreq.content_type))
+        {
+            let cap = req.body.len().min(limit);
+            wreq.body_text = String::from_utf8_lossy(&req.body[..cap]).to_string();
+        }
         // 真实 IP：反代后对端恒为回环，开了 `set_trust_forwarded_for` 才采纳 XFF
         // （否则 WAF 会把所有请求当回环，配合 loopback_bypass 就是整体放行）
         wreq.remote_ip = self.resolve_ip(req.remote_addr.as_deref(), req.header("x-forwarded-for"));
@@ -1262,6 +1279,33 @@ mod tests {
         assert!(is_loopback("::ffff:127.0.0.1"));
         assert!(is_loopback("::1"));
         assert!(!is_loopback("::ffff:8.8.8.8"));
+    }
+
+    /// 改个 Content-Type 不应能绕过 body 检测（开启 `body_scan_all_types` 后）。
+    #[test]
+    fn body_scan_all_types_catches_octet_stream_payload() {
+        let mut cfg = WafConfig::admin_api();
+        cfg.loopback_bypass = false;
+        cfg.body_scan_all_types = false;
+        cfg.body_scan_limit = 64 * 1024;
+        let waf = Waf::new(cfg);
+
+        let mut req = hreq("POST", vec![("Content-Type", "application/octet-stream")]);
+        req.body = bytes::Bytes::from_static(b"AppId=wx' or 1=1--");
+        // 默认：非文本不扫 → 放行（旧行为，保留为可配）
+        assert!(waf.check_http(&req).is_allow());
+
+        // 打开全类型扫描 → 同一请求被拦
+        let mut cfg = waf.config();
+        cfg.body_scan_all_types = true;
+        waf.apply_config(cfg).unwrap();
+        assert_eq!(waf.check_http(&req).blocked_status(), Some(403));
+
+        // 扫描上限生效：payload 放到上限之后则不扫到（证明上限可配）
+        let mut cfg = waf.config();
+        cfg.body_scan_limit = 4;
+        waf.apply_config(cfg).unwrap();
+        assert!(waf.check_http(&req).is_allow());
     }
 
     /// 头阶段检查也要认可信签名（否则已签名业务请求会被 UA 规则早拒）。
