@@ -97,6 +97,8 @@ pub struct Waf {
     last_mtime: AtomicU64,
     /// 运行统计（只累加被拦 + 请求总数；原子计数，几乎零开销）
     stats: crate::stats::WafStats,
+    /// 拦截日志去重（同 IP + 同原因 1 秒内只记一条）：防攻击洪峰把日志 IO 放大
+    log_throttle: LogThrottle,
 }
 
 impl Waf {
@@ -116,6 +118,7 @@ impl Waf {
             last_check: AtomicI64::new(0),
             last_mtime: AtomicU64::new(0),
             stats: crate::stats::WafStats::new(),
+            log_throttle: LogThrottle::new(),
         };
         waf.recompile();
         Arc::new(waf)
@@ -156,6 +159,7 @@ impl Waf {
             last_check: AtomicI64::new(0),
             last_mtime: AtomicU64::new(0),
             stats: crate::stats::WafStats::new(),
+            log_throttle: LogThrottle::new(),
         };
         waf.recompile();
         Arc::new(waf)
@@ -661,7 +665,15 @@ impl Waf {
                 .map(|v| v.iter().any(|p| req.path.starts_with(p.as_str())))
                 .unwrap_or(false);
         if !skip_attack {
-            for kind in attack::scan_all(&req.path, &req.query, &req.body_text) {
+            // 静态资源（js/css/图片/字体）只做「路径穿越 / 敏感路径」检测：
+            // 这些文件内容天然含 `' or `、`<script` 之类片段，跑全量特征是误报高发区，
+            // 且面板每次加载都要重复扫 N 个文件——省掉这部分每请求的字符串分配。
+            let kinds = if is_static_asset(&req.path) {
+                attack::scan_path(&req.path, &req.query)
+            } else {
+                attack::scan_all(&req.path, &req.query, &req.body_text)
+            };
+            for kind in kinds {
                 let mut action = match kind {
                     AttackKind::SqlInjection => cfg.sqli_action,
                     AttackKind::Xss => cfg.xss_action,
@@ -749,7 +761,7 @@ impl Waf {
     ) -> Verdict {
         // 统计（只累加被拦请求：原因分类 + 分钟窗口 + Top IP）
         self.stats.record_block(kind, &req.remote_ip);
-        if cfg.log_blocked {
+        if cfg.log_blocked && self.log_throttle.allow(&req.remote_ip, &reason) {
             dhrust::logs::log().warn(&format!(
                 "[WAF] 拦截 {} {} 状态={} IP={} UA={} 原因={}",
                 req.method,
@@ -814,6 +826,47 @@ fn is_static_asset(path: &str) -> bool {
 fn brief(s: &str) -> String {
     let t: String = s.chars().take(80).collect();
     if s.chars().count() > 80 { format!("{t}…") } else { t }
+}
+
+/// 拦截日志去重器：同「IP + 原因」在 1 秒窗口内只放行一条日志。
+///
+/// 目的：攻击洪峰时 `blocked()` 每个请求写一条 warn 会把日志 IO 放大成瓶颈；
+/// 计数与统计不受影响（统计是原子计数，与日志无关）。
+struct LogThrottle {
+    inner: std::sync::Mutex<std::collections::HashMap<u64, std::time::Instant>>,
+}
+
+impl LogThrottle {
+    fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn allow(&self, ip: &str, reason: &str) -> bool {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        ip.hash(&mut h);
+        reason.hash(&mut h);
+        let key = h.finish();
+
+        let now = std::time::Instant::now();
+        let mut map = match self.inner.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        // 容量保护：条目过多时清掉 60 秒前的旧记录（Top 攻击源数量有界，不会无限涨）
+        if map.len() > 512 {
+            map.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(60));
+        }
+        if let Some(t) = map.get(&key)
+            && now.duration_since(*t) < std::time::Duration::from_secs(1)
+        {
+            return false;
+        }
+        map.insert(key, now);
+        true
+    }
 }
 
 fn now_ms() -> i64 {
@@ -1279,6 +1332,44 @@ mod tests {
         assert!(is_loopback("::ffff:127.0.0.1"));
         assert!(is_loopback("::1"));
         assert!(!is_loopback("::ffff:8.8.8.8"));
+    }
+
+    /// 静态资源只做路径穿越检测：内容型关键字不误报，但穿越仍要拦。
+    #[test]
+    fn static_asset_scans_path_only() {
+        let mut cfg = WafConfig::admin_api();
+        cfg.loopback_bypass = false;
+        let waf = Waf::new(cfg);
+
+        // JS 文件路径 + 查询串里带 XSS/SQLi 关键字 → 静态资源跳过内容型特征
+        let mut r = wreq("/panel/app.js");
+        r.query = "v=<script>alert(1)</script>".to_string();
+        assert!(waf.check(&r).is_allow(), "静态资源不应因内容型特征被拦");
+
+        // 同一路径带路径穿越 → 仍必须拦
+        let mut r = wreq("/panel/app.js");
+        r.query = "f=../../etc/passwd".to_string();
+        assert_eq!(waf.check(&r).blocked_status(), Some(403));
+
+        // 非静态路径带同样关键字 → 照常拦
+        let mut r = wreq("/panel/api/save");
+        r.query = "v=<script>alert(1)</script>".to_string();
+        assert_eq!(waf.check(&r).blocked_status(), Some(403));
+    }
+
+    /// 日志去重不改变统计口径：连续拦截仍逐条计数。
+    #[test]
+    fn log_throttle_does_not_affect_stats() {
+        let mut cfg = WafConfig::admin_api();
+        cfg.loopback_bypass = false;
+        let waf = Waf::new(cfg);
+        let mut r = wreq("/api/x");
+        r.query = "a=' or 1=1".to_string();
+        for _ in 0..3 {
+            assert_eq!(waf.check(&r).blocked_status(), Some(403));
+        }
+        let snap = waf.stats();
+        assert_eq!(snap.blocked, 3, "去重只影响日志，不影响计数：{snap:?}");
     }
 
     /// 改个 Content-Type 不应能绕过 body 检测（开启 `body_scan_all_types` 后）。

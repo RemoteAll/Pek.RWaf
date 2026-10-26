@@ -170,22 +170,37 @@ fn hex_val(b: u8) -> Option<u8> {
 }
 
 /// 规范化：解码（两次，覆盖双重编码）+ 小写 + 空白折叠。
+///
+/// 优化：解码一次后已不含 `%` 时**不再做第二次解码**（正常请求省一次分配与拷贝）。
 pub fn normalize(text: &str) -> String {
     let once = percent_decode(text);
-    let twice = percent_decode(&once);
-    let combined = format!("{once} {twice}");
-    let mut out = String::with_capacity(combined.len());
-    let mut last_space = false;
-    for c in combined.chars() {
-        let c = c.to_ascii_lowercase();
-        if c.is_whitespace() {
-            if !last_space {
-                out.push(' ');
-                last_space = true;
+    let twice = if once.contains('%') {
+        percent_decode(&once)
+    } else {
+        String::new()
+    };
+    let mut out = String::with_capacity(once.len() + twice.len() + 1);
+    let mut last_space = true; // 起始不加多余空格
+    for (i, seg) in [once.as_str(), twice.as_str()].into_iter().enumerate() {
+        if seg.is_empty() {
+            continue;
+        }
+        // 两段之间保证至少一个空格（与旧实现 `"{once} {twice}"` 等价）
+        if i > 0 && !last_space {
+            out.push(' ');
+            last_space = true;
+        }
+        for c in seg.chars() {
+            let c = c.to_ascii_lowercase();
+            if c.is_whitespace() {
+                if !last_space {
+                    out.push(' ');
+                    last_space = true;
+                }
+            } else {
+                out.push(c);
+                last_space = false;
             }
-        } else {
-            out.push(c);
-            last_space = false;
         }
     }
     out
@@ -193,6 +208,19 @@ pub fn normalize(text: &str) -> String {
 
 fn hit(text: &str, patterns: &[&str]) -> bool {
     patterns.iter().any(|p| text.contains(p))
+}
+
+/// 只做「路径穿越 / 敏感路径」检测。
+///
+/// 静态资源（js/css/图片/字体）专用：这些文件的**内容**天然含有 `' or `、`<script`
+/// 之类片段，跑全量扫描是误报高发区；但路径穿越仍然必须拦。
+pub fn scan_path(path: &str, query: &str) -> Vec<AttackKind> {
+    let text = normalize(&format!("{path}?{query}"));
+    if hit(&text, PATH_PATTERNS) {
+        vec![AttackKind::PathTraversal]
+    } else {
+        Vec::new()
+    }
 }
 
 /// 综合扫描（规范化一次，返回全部命中的类别——便于按策略分别处理）。
