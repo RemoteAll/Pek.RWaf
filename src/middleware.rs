@@ -86,6 +86,9 @@ pub struct Waf {
     forced_skip_bot: RwLock<Vec<String>>,
     /// 强制跳过攻击特征检测的路径前缀（同上）
     forced_skip_attack: RwLock<Vec<String>>,
+    /// 是否在「直连对端是回环」时采纳 `X-Forwarded-For`（反向代理后取真实 IP；
+    /// 内存态——与项目自己的 `client_ip` 口径保持一致，避免 WAF 看到的全是 127.0.0.1）
+    trust_forwarded_for: RwLock<bool>,
     file: Option<PathBuf>,
     /// 创建时的预设配置（部分键缺失的旧文件/面板提交用其补齐）
     preset: WafConfig,
@@ -106,6 +109,7 @@ impl Waf {
             trusted_secret: RwLock::new(None),
             forced_skip_bot: RwLock::new(Vec::new()),
             forced_skip_attack: RwLock::new(Vec::new()),
+            trust_forwarded_for: RwLock::new(false),
             file: None,
             preset: config,
             base_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -145,6 +149,7 @@ impl Waf {
             trusted_secret: RwLock::new(None),
             forced_skip_bot: RwLock::new(Vec::new()),
             forced_skip_attack: RwLock::new(Vec::new()),
+            trust_forwarded_for: RwLock::new(false),
             file: Some(file),
             preset: default,
             base_dir: base.to_path_buf(),
@@ -220,8 +225,53 @@ impl Waf {
         (bot, attack)
     }
 
+    /// 是否在「直连对端是回环」时采纳 `X-Forwarded-For`（**内存态**）。
+    ///
+    /// 反向代理之后，TCP 对端恒为 `127.0.0.1`——若不开这个，WAF 会把所有请求都当成回环：
+    /// 一旦 `loopback_bypass = true` 就是**整体放行**，IP 黑名单与 Top IP 也全失效。
+    /// 只在对端确为回环时才采纳 XFF，避免客户端伪造头部绕过。
+    pub fn set_trust_forwarded_for(&self, trust: bool) {
+        match self.trust_forwarded_for.write() {
+            Ok(mut w) => *w = trust,
+            Err(p) => *p.into_inner() = trust,
+        }
+    }
+
+    /// 当前是否信任转发头（诊断用）。
+    pub fn trust_forwarded_for(&self) -> bool {
+        match self.trust_forwarded_for.read() {
+            Ok(g) => *g,
+            Err(p) => *p.into_inner(),
+        }
+    }
+
+    /// 解析真实客户端 IP：`(TCP 对端, X-Forwarded-For)` → 纯 IP 串。
+    ///
+    /// 与项目业务层的 `client_ip` 口径一致：**仅当对端是回环**时才采纳 XFF 的第一段。
+    fn resolve_ip(&self, peer: Option<&str>, xff: Option<&str>) -> String {
+        let peer_ip = crate::wafreq::strip_port(peer.unwrap_or(""));
+        if self.trust_forwarded_for()
+            && is_loopback(&peer_ip)
+            && let Some(xff) = xff
+        {
+            let first = xff.split(',').next().unwrap_or("").trim();
+            if !first.is_empty() {
+                return crate::wafreq::strip_port(first);
+            }
+        }
+        peer_ip
+    }
+
     /// 请求签名是否为当前可信业务请求（SHA1(排序后的 timestamp+nonce+secret)）。
     fn trusted_signed(&self, req: &dhrust::net::http::HttpRequest) -> bool {
+        self.trusted_signed_by(|name| req.header(name))
+    }
+
+    /// 同 [`trusted_signed`]，但头部取值由调用方提供（完整请求 / 头快照共用）。
+    fn trusted_signed_by<'a>(
+        &self,
+        header: impl Fn(&str) -> Option<&'a str>,
+    ) -> bool {
         let secret = match self.trusted_secret.read() {
             Ok(g) => g.clone(),
             Err(p) => p.into_inner().clone(),
@@ -229,9 +279,9 @@ impl Waf {
         let Some(secret) = secret else {
             return false;
         };
-        let timestamp = req.header("TimeStamp").unwrap_or("").trim();
-        let nonce = req.header("Nonce").unwrap_or("").trim();
-        let signature = req.header("Signature").unwrap_or("").trim();
+        let timestamp = header("TimeStamp").unwrap_or("").trim();
+        let nonce = header("Nonce").unwrap_or("").trim();
+        let signature = header("Signature").unwrap_or("").trim();
         if timestamp.is_empty() || nonce.is_empty() || signature.is_empty() {
             return false;
         }
@@ -380,7 +430,10 @@ impl Waf {
         if self.trusted_signed(req) {
             return Verdict::Allow;
         }
-        let wreq = WafRequest::from_http(req);
+        let mut wreq = WafRequest::from_http(req);
+        // 真实 IP：反代后对端恒为回环，开了 `set_trust_forwarded_for` 才采纳 XFF
+        // （否则 WAF 会把所有请求当回环，配合 loopback_bypass 就是整体放行）
+        wreq.remote_ip = self.resolve_ip(req.remote_addr.as_deref(), req.header("x-forwarded-for"));
         // CSRF/跨站来源校验先于回环豁免：浏览器跨站请求的源 IP 恰是回环（localhost/面板免登录场景防护）。
         // 无 Sec-Fetch-Site 与 Origin 的请求（curl / 服务间调用 / 旧客户端）不进此分支。
         if let Some(reason) = csrf_check(req) {
@@ -407,8 +460,39 @@ impl Waf {
     /// - 攻击扫描只能看 `path`/`query`（`body_text` 为空）——正好是「不需 body 就能判断」那部分。
     ///
     /// 用于 HTTP 层的早拒钩子：UA/IP/路径/查询串特征命中时，**不用收完 body 就能拒绝**。
+    ///
+    /// 注意：只能看头部不包含的东西（body），因此不含 body 级规则；
+    /// 需要「签名 / CSRF」也提前判时用 [`check_head_http`](Self::check_head_http)。
     pub fn check_head(&self, req: &WafRequest) -> Verdict {
         self.check_inner(req)
+    }
+
+    /// **头阶段**检查（完整形态）：从 [`HttpRequestHead`] 构造，除 [`check_head`] 的规则外，
+    /// 还会：① 先认可信业务签名（已签名请求不应被 UA 规则误拦）；
+    /// ② 跑 CSRF/跨站来源校验（纯头判断，无需 body）；③ 用真实 IP（回环时采纳 XFF）。
+    ///
+    /// 用于 `HttpServerOptions.early_guard`：全部判断都不需要 body。
+    pub fn check_head_http(&self, head: &dhrust::net::http::HttpRequestHead) -> Verdict {
+        if self.trusted_signed_by(|name| head.header(name)) {
+            return Verdict::Allow;
+        }
+        let mut wreq = WafRequest::from_head(head);
+        wreq.remote_ip = self.resolve_ip(head.remote_addr.as_deref(), head.header("x-forwarded-for"));
+        if let Some(reason) = csrf_reason(
+            &head.method,
+            head.header("sec-fetch-site").unwrap_or(""),
+            head.header("origin").unwrap_or(""),
+            head.header("host").unwrap_or(""),
+        ) {
+            let cfg = match self.config.read() {
+                Ok(c) => c,
+                Err(p) => p.into_inner(),
+            };
+            if cfg.enable && cfg.csrf_guard {
+                return self.blocked(&cfg, 403, reason, &wreq, crate::stats::BlockKind::Csrf);
+            }
+        }
+        self.check_inner(&wreq)
     }
 
     fn check_inner(&self, req: &WafRequest) -> Verdict {
@@ -690,9 +774,10 @@ impl Waf {
     }
 }
 
-/// 是否回环地址。
+/// 是否回环地址（含 IPv4 映射：`::ffff:127.0.0.1`——双栈监听时对端常见此形态）。
 pub fn is_loopback(ip: &str) -> bool {
     let ip = ip.trim();
+    let ip = ip.strip_prefix("::ffff:").unwrap_or(ip);
     ip == "::1"
         || ip == "0:0:0:0:0:0:0:1"
         || ip.eq_ignore_ascii_case("localhost")
@@ -728,15 +813,21 @@ fn now_ms() -> i64 {
 /// 2. 无 Sec-Fetch-Site 但有 `Origin`：与请求 `Host` 同源才放行（`null` 视作跨站拒绝）；
 /// 3. 两类头均无（curl / .NET HttpClient / 服务间调用）→ 放行。
 fn csrf_check(req: &dhrust::net::http::HttpRequest) -> Option<String> {
-    let m = req.method.to_ascii_uppercase();
+    csrf_reason(
+        &req.method,
+        req.header("sec-fetch-site").unwrap_or(""),
+        req.header("origin").unwrap_or(""),
+        req.header("host").unwrap_or(""),
+    )
+}
+
+/// 同 [`csrf_check`]，但参数化（完整请求 / 头快照共用）。
+fn csrf_reason(method: &str, sec_fetch_site: &str, origin: &str, host: &str) -> Option<String> {
+    let m = method.to_ascii_uppercase();
     if !matches!(m.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
         return None;
     }
-    let site = req
-        .header("sec-fetch-site")
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
+    let site = sec_fetch_site.trim().to_ascii_lowercase();
     if !site.is_empty() {
         return if site == "cross-site" {
             Some("跨站请求（Sec-Fetch-Site: cross-site）".to_string())
@@ -744,14 +835,14 @@ fn csrf_check(req: &dhrust::net::http::HttpRequest) -> Option<String> {
             None
         };
     }
-    let origin = req.header("origin").unwrap_or("").trim();
+    let origin = origin.trim();
     if origin.is_empty() {
         return None;
     }
     if origin == "null" {
         return Some("跨站来源（Origin: null——file:// 或沙盒页面）".to_string());
     }
-    let host = req.header("host").unwrap_or("").trim();
+    let host = host.trim();
     let origin_host = origin.split("://").nth(1).unwrap_or(origin);
     if !host.is_empty() && !origin_host.eq_ignore_ascii_case(host) {
         return Some(format!("跨站来源（Origin: {origin} ≠ Host: {host}）"));
@@ -1142,6 +1233,77 @@ mod tests {
         r.user_agent = "Nikto/2.5.0".into();
         // 已被恶意名单直接拦（先于规则）
         assert_eq!(waf.check(&r).blocked_status(), Some(403));
+    }
+
+    /// 反向代理场景：只有「对端是回环」且开启信任时才采纳 `X-Forwarded-For`。
+    #[test]
+    fn forwarded_for_used_only_for_loopback_peer() {
+        let mut cfg = WafConfig::admin_api();
+        cfg.loopback_bypass = false;
+        cfg.ip_blacklist = vec!["6.6.6.6".to_string()];
+        let waf = Waf::new(cfg);
+
+        // 未开信任：无论 XFF 是什么，都按对端 IP（回环）处理
+        let mut req = hreq("GET", vec![("X-Forwarded-For", "6.6.6.6")]);
+        assert_eq!(waf.check_http(&req).blocked_status(), None);
+
+        // 开信任 + 对端回环 → 采用 XFF 首段，命中黑名单
+        waf.set_trust_forwarded_for(true);
+        assert!(waf.trust_forwarded_for());
+        assert_eq!(waf.check_http(&req).blocked_status(), Some(403));
+
+        // 对端不是回环 → 忽略 XFF（防伪造）
+        req.remote_addr = Some("10.1.2.3:5000".to_string());
+        assert_eq!(waf.check_http(&req).blocked_status(), None);
+    }
+
+    #[test]
+    fn ipv4_mapped_loopback_is_loopback() {
+        assert!(is_loopback("::ffff:127.0.0.1"));
+        assert!(is_loopback("::1"));
+        assert!(!is_loopback("::ffff:8.8.8.8"));
+    }
+
+    /// 头阶段检查也要认可信签名（否则已签名业务请求会被 UA 规则早拒）。
+    #[test]
+    fn head_stage_respects_trusted_signature_and_csrf() {
+        let mut cfg = WafConfig::admin_api();
+        cfg.loopback_bypass = false;
+        let waf = Waf::new(cfg);
+        waf.set_trusted_signature_secret("s3cret");
+
+        let ts = dhrust::times::getmilltimestamp().to_string();
+        let nonce = "n-abcdefgh";
+        let sig =
+            dhrust::sign::create_signature(ts.clone(), nonce.to_string(), "s3cret".to_string());
+        let head = |extra: Vec<(&str, &str)>| {
+            let mut headers: Vec<(String, String)> = vec![
+                ("user-agent".to_string(), "RestSharp/114.0.0.0".to_string()),
+                ("host".to_string(), "127.0.0.1:5501".to_string()),
+            ];
+            headers.extend(extra.into_iter().map(|(k, v)| (k.to_string(), v.to_string())));
+            dhrust::net::http::HttpRequestHead {
+                method: "POST".to_string(),
+                path: "/api/action".to_string(),
+                query: String::new(),
+                headers,
+                remote_addr: Some("127.0.0.1:5000".to_string()),
+                content_length: None,
+            }
+        };
+
+        // 未签名 + RestSharp UA（恶意爬虫名单）→ 头阶段 403
+        assert_eq!(waf.check_head_http(&head(vec![])).blocked_status(), Some(403));
+        // 带有效签名 → 头阶段放行
+        let signed = head(vec![
+            ("TimeStamp", &ts),
+            ("Nonce", nonce),
+            ("Signature", &sig),
+        ]);
+        assert_eq!(waf.check_head_http(&signed).blocked_status(), None);
+        // 跨站写操作 → 头阶段即拦（无需 body）
+        let cross = head(vec![("Sec-Fetch-Site", "cross-site")]);
+        assert_eq!(waf.check_head_http(&cross).blocked_status(), Some(403));
     }
 }
 
