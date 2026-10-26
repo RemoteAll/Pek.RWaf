@@ -1,6 +1,6 @@
 [package]
 name = "pek-rwaf"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Pek Web 防火墙（Rust）：规则引擎 + IP/爬虫分级（放行搜索引擎与 GEO-AI 抓取、拦截恶意爬虫）+ SQLi/XSS/路径穿越检测 + CC 限流 + 接口级多策略限流（对齐 C# DH.RateLimter），接入 dhrust 中间件"
 authors = ["PeiKeSmart"]

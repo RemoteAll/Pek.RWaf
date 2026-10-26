@@ -34,10 +34,12 @@ pub mod config;
 pub mod middleware;
 pub mod ratelimit;
 pub mod rules;
+pub mod stats;
 pub mod throttle;
 pub mod wafreq;
 
 pub use config::{WafConfig, WafMode};
 pub use middleware::{Verdict, Waf};
 pub use throttle::{RateValve, Throttle, ThrottleConfig, ThrottleRule, ThrottleVerdict, WhenNull};
+pub use stats::{BlockKind, WafStats, WafStatsSnapshot};
 pub use wafreq::WafRequest;

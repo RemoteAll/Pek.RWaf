@@ -92,6 +92,8 @@ pub struct Waf {
     base_dir: PathBuf,
     last_check: AtomicI64,
     last_mtime: AtomicU64,
+    /// 运行统计（只累加被拦 + 请求总数；原子计数，几乎零开销）
+    stats: crate::stats::WafStats,
 }
 
 impl Waf {
@@ -109,6 +111,7 @@ impl Waf {
             base_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             last_check: AtomicI64::new(0),
             last_mtime: AtomicU64::new(0),
+            stats: crate::stats::WafStats::new(),
         };
         waf.recompile();
         Arc::new(waf)
@@ -147,9 +150,20 @@ impl Waf {
             base_dir: base.to_path_buf(),
             last_check: AtomicI64::new(0),
             last_mtime: AtomicU64::new(0),
+            stats: crate::stats::WafStats::new(),
         };
         waf.recompile();
         Arc::new(waf)
+    }
+
+    /// 运行统计快照（「当前是否正在被攻击」的判定入口；零磁盘/零网络）。
+    ///
+    /// - `total`：经过 WAF 的请求数；`blocked`：被拦数；
+    /// - `last_minute` / `last_5_minutes`：分钟窗口拦截数（突增即扫描/攻击特征）；
+    /// - `by_reason`：按原因分类（多类同时出现常见于工具扫描）；
+    /// - `top_ips`：Top 来源 IP（固定 16 容量，不会随攻击流量膨胀）。
+    pub fn stats(&self) -> crate::stats::WafStatsSnapshot {
+        self.stats.snapshot()
     }
 
     /// 设置可信业务请求签名密钥（内存态，不写配置文件；空串=关闭）。
@@ -375,7 +389,7 @@ impl Waf {
                 Err(p) => p.into_inner(),
             };
             if cfg.enable && cfg.csrf_guard {
-                return self.blocked(&cfg, 403, reason, &wreq);
+                return self.blocked(&cfg, 403, reason, &wreq, crate::stats::BlockKind::Csrf);
             }
         }
         self.check(&wreq)
@@ -383,6 +397,21 @@ impl Waf {
 
     /// 对规范化请求执行检查。
     pub fn check(&self, req: &WafRequest) -> Verdict {
+        // 统计：每请求一次原子递增（放行路径也只有这一次）
+        self.stats.record_request();
+        self.check_inner(req)
+    }
+
+    /// **头阶段**检查（还没读 body 时调）：与 [`check`] 同规则，但
+    /// - **不**累加请求计数（避免与之后的 [`check`] 重复计数）；拦截仍正常计入统计；
+    /// - 攻击扫描只能看 `path`/`query`（`body_text` 为空）——正好是「不需 body 就能判断」那部分。
+    ///
+    /// 用于 HTTP 层的早拒钩子：UA/IP/路径/查询串特征命中时，**不用收完 body 就能拒绝**。
+    pub fn check_head(&self, req: &WafRequest) -> Verdict {
+        self.check_inner(req)
+    }
+
+    fn check_inner(&self, req: &WafRequest) -> Verdict {
         // 先做（10s 节流的）配置热重载检查——被拦截的请求也参与，保证改配置后及时生效
         self.maybe_reload();
         let cfg = match self.config.read() {
@@ -403,7 +432,13 @@ impl Waf {
             return Verdict::Allow;
         }
         if !cfg.ip_blacklist.is_empty() && ip_in_list(ip, &cfg.ip_blacklist.join(",")) {
-            return self.blocked(&cfg, 403, format!("IP 黑名单：{ip}"), req);
+            return self.blocked(
+                &cfg,
+                403,
+                format!("IP 黑名单：{ip}"),
+                req,
+                crate::stats::BlockKind::IpBlacklist,
+            );
         }
 
         let ua_lower = req.user_agent.trim().to_ascii_lowercase();
@@ -412,10 +447,10 @@ impl Waf {
         if !cfg.extra_block_bots.is_empty()
             && cfg.extra_block_bots.iter().any(|k| ua_lower.contains(&k.to_ascii_lowercase()))
         {
-            return self.blocked(&cfg, 403, "自定义拦截 UA".to_string(), req);
+            return self.blocked(&cfg, 403, "自定义拦截 UA".to_string(), req, crate::stats::BlockKind::CustomRule);
         }
         if cfg.block_empty_ua && ua_lower.is_empty() {
-            return self.blocked(&cfg, 403, "空 User-Agent".to_string(), req);
+            return self.blocked(&cfg, 403, "空 User-Agent".to_string(), req, crate::stats::BlockKind::CustomRule);
         }
 
         let extra_allowed = !cfg.extra_allow_bots.is_empty()
@@ -450,6 +485,7 @@ impl Waf {
                             403,
                             format!("恶意爬虫/扫描器：{}", brief(&req.user_agent)),
                             req,
+                            crate::stats::BlockKind::Bot,
                         );
                     }
                 }
@@ -460,6 +496,7 @@ impl Waf {
                             403,
                             format!("敏感路径禁止机器人（{}）", kind.name_cn()),
                             req,
+                            crate::stats::BlockKind::Bot,
                         );
                     }
                     let allowed = match kind {
@@ -484,6 +521,7 @@ impl Waf {
                             403,
                             format!("未放行的机器人：{}", kind.name_cn()),
                             req,
+                            crate::stats::BlockKind::Bot,
                         );
                     }
                 }
@@ -494,6 +532,7 @@ impl Waf {
                             403,
                             format!("敏感路径禁止机器人（{}）", kind.name_cn()),
                             req,
+                            crate::stats::BlockKind::Bot,
                         );
                     }
                     if cfg.verbose {
@@ -544,11 +583,18 @@ impl Waf {
                         }
                     }
                     Action::Block => {
+                        let block_kind = match kind {
+                            AttackKind::SqlInjection => crate::stats::BlockKind::SqlInjection,
+                            AttackKind::Xss => crate::stats::BlockKind::Xss,
+                            AttackKind::PathTraversal => crate::stats::BlockKind::PathTraversal,
+                            AttackKind::CommandInjection => crate::stats::BlockKind::CommandInjection,
+                        };
                         return self.blocked(
                             &cfg,
                             403,
                             format!("{} 特征：{}", kind.name_cn(), brief(&req.path)),
                             req,
+                            block_kind,
                         );
                     }
                 }
@@ -563,7 +609,13 @@ impl Waf {
             };
             for rule in rules.iter() {
                 if rules::eval(rule, req) {
-                    return self.blocked(&cfg, 403, format!("自定义规则：{}", rule.label()), req);
+                    return self.blocked(
+                        &cfg,
+                        403,
+                        format!("自定义规则：{}", rule.label()),
+                        req,
+                        crate::stats::BlockKind::CustomRule,
+                    );
                 }
             }
         }
@@ -579,13 +631,23 @@ impl Waf {
                 429,
                 format!("请求频率超限（{} 次/分钟）", cfg.rate_limit_per_min),
                 req,
+                crate::stats::BlockKind::RateLimit,
             );
         }
 
         Verdict::Allow
     }
 
-    fn blocked(&self, cfg: &WafConfig, status: u16, reason: String, req: &WafRequest) -> Verdict {
+    fn blocked(
+        &self,
+        cfg: &WafConfig,
+        status: u16,
+        reason: String,
+        req: &WafRequest,
+        kind: crate::stats::BlockKind,
+    ) -> Verdict {
+        // 统计（只累加被拦请求：原因分类 + 分钟窗口 + Top IP）
+        self.stats.record_block(kind, &req.remote_ip);
         if cfg.log_blocked {
             dhrust::logs::log().warn(&format!(
                 "[WAF] 拦截 {} {} 状态={} IP={} UA={} 原因={}",

@@ -1,6 +1,6 @@
 //! 请求视图与 IP 匹配工具（CIDR / 通配符 / 列表 / 文件）。
 
-use dhrust::net::http::HttpRequest;
+use dhrust::net::http::{HttpRequest, HttpRequestHead};
 
 /// WAF 请求视图（从 [`HttpRequest`] 提取；字段均为小写归一化前的原文）。
 #[derive(Debug, Clone, Default)]
@@ -44,6 +44,23 @@ impl WafRequest {
             remote_ip: strip_port(req.remote_addr.as_deref().unwrap_or("")),
             content_type,
             body_text,
+        }
+    }
+
+    /// 从 **请求头快照** 构建（还没读 body 时）。
+    ///
+    /// 与 [`from_http`] 的差别只有 `body_text` 恒为空——因为此刻 body 还没收到。
+    /// 用于 HTTP 层的早拒钩子：UA / IP / 路径 / 查询串命中特征即可拒绝，
+    /// **不让对方把大 body 传上来**（省带宽）。body 级规则由之后的 [`Waf::check`](crate::Waf::check) 补齐。
+    pub fn from_head(head: &HttpRequestHead) -> Self {
+        Self {
+            path: head.path.clone(),
+            method: head.method.clone(),
+            query: head.query.clone(),
+            user_agent: head.header("user-agent").unwrap_or("").to_string(),
+            remote_ip: strip_port(head.remote_addr.as_deref().unwrap_or("")),
+            content_type: head.header("content-type").unwrap_or("").to_string(),
+            body_text: String::new(),
         }
     }
 
