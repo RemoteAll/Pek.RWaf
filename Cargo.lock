@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "dhrust"
-version = "0.5.4"
+version = "0.5.7"
 dependencies = [
  "base64",
  "chrono",

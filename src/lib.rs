@@ -40,6 +40,6 @@ pub mod wafreq;
 
 pub use config::{WafConfig, WafMode};
 pub use middleware::{Verdict, Waf};
-pub use throttle::{RateValve, Throttle, ThrottleConfig, ThrottleRule, ThrottleVerdict, WhenNull};
 pub use stats::{BlockKind, WafStats, WafStatsSnapshot};
+pub use throttle::{RateValve, Throttle, ThrottleConfig, ThrottleRule, ThrottleVerdict, WhenNull};
 pub use wafreq::WafRequest;

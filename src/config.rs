@@ -73,7 +73,8 @@ pub struct WafConfig {
     pub sensitive_prefixes: Vec<String>,
     /// 跳过攻击特征检测的路径前缀（本体即“执行 SQL / 传文件”的管理端点；
     /// 这些端点的安全由业务层护栏（只读 SQL 校验、权限、审计）负责；bot/IP/CC 检查不受影响）
-    pub skip_attack_prefixes: Vec<String>,    /// 跳过机器人拦截的路径前缀（机器对机器 API——如产测工具调用接口；
+    pub skip_attack_prefixes: Vec<String>,
+    /// 跳过机器人拦截的路径前缀（机器对机器 API——如产测工具调用接口；
     /// 攻击检测/IP 名单/CC 限速不受影响）
     pub skip_bot_prefixes: Vec<String>,
     /// 跨站来源校验（CSRF 防护）：浏览器发起的**非安全方法**请求（POST/PUT/PATCH/DELETE）校验
@@ -296,12 +297,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let file = dir.join(CONFIG_REL);
         let mut cfg = WafConfig::admin_api();
-        cfg.ruleset = Some(serde_json::from_str(r#"{
+        cfg.ruleset = Some(
+            serde_json::from_str(
+                r#"{
             "Operator": "OrElse",
             "Rules": [
                 { "MemberName": "Path", "Operator": "EndsWith", "Inputs": [".php", 42, true] }
             ]
-        }"#).unwrap());
+        }"#,
+            )
+            .unwrap(),
+        );
         cfg.save(&file).expect("保存 TOML（含规则集）");
         let loaded = WafConfig::load_merging(&file, &WafConfig::default()).expect("读回");
         assert!(loaded.ruleset.is_some(), "规则集不能丢");
@@ -337,4 +343,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-

@@ -61,9 +61,7 @@ pub const SQLI_PATTERNS: &[&str] = &[
     "';--",
     "\" --",
     "order by 1--",
-]
-
-;
+];
 
 /// XSS 特征。
 pub const XSS_PATTERNS: &[&str] = &[
@@ -272,9 +270,17 @@ mod tests {
     #[test]
     fn normal_input_not_flagged() {
         // 中文搜索 / 正常卡名 / 尾号
-        let v = scan_all("/cards", "q=%E6%8B%9B%E5%95%86%E7%BB%8F%E5%85%B8%E7%99%BD%E9%87%91%E5%8D%A1&page=1", "");
+        let v = scan_all(
+            "/cards",
+            "q=%E6%8B%9B%E5%95%86%E7%BB%8F%E5%85%B8%E7%99%BD%E9%87%91%E5%8D%A1&page=1",
+            "",
+        );
         assert!(v.is_empty(), "正常搜索不应误报：{v:?}");
-        let v = scan_all("/api/my/cardSave", "", "{\"cardTail\":\"8888\",\"alias\":\"我的卡\"}");
+        let v = scan_all(
+            "/api/my/cardSave",
+            "",
+            "{\"cardTail\":\"8888\",\"alias\":\"我的卡\"}",
+        );
         assert!(v.is_empty(), "正常表单不应误报：{v:?}");
     }
 
@@ -290,6 +296,8 @@ mod tests {
     #[test]
     fn xss_and_cmd_detected() {
         assert!(scan_all("/search", "q=<script>alert(1)</script>", "").contains(&AttackKind::Xss));
-        assert!(scan_all("/api/x", "file=;cat /etc/hosts", "").contains(&AttackKind::CommandInjection));
+        assert!(
+            scan_all("/api/x", "file=;cat /etc/hosts", "").contains(&AttackKind::CommandInjection)
+        );
     }
 }

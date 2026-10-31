@@ -272,10 +272,7 @@ impl Waf {
     }
 
     /// 同 [`trusted_signed`]，但头部取值由调用方提供（完整请求 / 头快照共用）。
-    fn trusted_signed_by<'a>(
-        &self,
-        header: impl Fn(&str) -> Option<&'a str>,
-    ) -> bool {
+    fn trusted_signed_by<'a>(&self, header: impl Fn(&str) -> Option<&'a str>) -> bool {
         let secret = match self.trusted_secret.read() {
             Ok(g) => g.clone(),
             Err(p) => p.into_inner().clone(),
@@ -289,11 +286,8 @@ impl Waf {
         if timestamp.is_empty() || nonce.is_empty() || signature.is_empty() {
             return false;
         }
-        let expect = dhrust::sign::create_signature(
-            timestamp.to_string(),
-            nonce.to_string(),
-            secret,
-        );
+        let expect =
+            dhrust::sign::create_signature(timestamp.to_string(), nonce.to_string(), secret);
         if expect.is_empty() {
             return false;
         }
@@ -369,7 +363,8 @@ impl Waf {
             && let Ok(t) = meta.modified()
             && let Ok(d) = t.duration_since(std::time::UNIX_EPOCH)
         {
-            self.last_mtime.store(d.as_millis() as u64, Ordering::Relaxed);
+            self.last_mtime
+                .store(d.as_millis() as u64, Ordering::Relaxed);
         }
     }
 
@@ -498,7 +493,8 @@ impl Waf {
             return Verdict::Allow;
         }
         let mut wreq = WafRequest::from_head(head);
-        wreq.remote_ip = self.resolve_ip(head.remote_addr.as_deref(), head.header("x-forwarded-for"));
+        wreq.remote_ip =
+            self.resolve_ip(head.remote_addr.as_deref(), head.header("x-forwarded-for"));
         if let Some(reason) = csrf_reason(
             &head.method,
             head.header("sec-fetch-site").unwrap_or(""),
@@ -550,18 +546,39 @@ impl Waf {
 
         // —— 自定义 UA 规则 ——
         if !cfg.extra_block_bots.is_empty()
-            && cfg.extra_block_bots.iter().any(|k| ua_lower.contains(&k.to_ascii_lowercase()))
+            && cfg
+                .extra_block_bots
+                .iter()
+                .any(|k| ua_lower.contains(&k.to_ascii_lowercase()))
         {
-            return self.blocked(&cfg, 403, "自定义拦截 UA".to_string(), req, crate::stats::BlockKind::CustomRule);
+            return self.blocked(
+                &cfg,
+                403,
+                "自定义拦截 UA".to_string(),
+                req,
+                crate::stats::BlockKind::CustomRule,
+            );
         }
         if cfg.block_empty_ua && ua_lower.is_empty() {
-            return self.blocked(&cfg, 403, "空 User-Agent".to_string(), req, crate::stats::BlockKind::CustomRule);
+            return self.blocked(
+                &cfg,
+                403,
+                "空 User-Agent".to_string(),
+                req,
+                crate::stats::BlockKind::CustomRule,
+            );
         }
 
         let extra_allowed = !cfg.extra_allow_bots.is_empty()
-            && cfg.extra_allow_bots.iter().any(|k| ua_lower.contains(&k.to_ascii_lowercase()));
+            && cfg
+                .extra_allow_bots
+                .iter()
+                .any(|k| ua_lower.contains(&k.to_ascii_lowercase()));
         let sensitive = !cfg.sensitive_prefixes.is_empty()
-            && cfg.sensitive_prefixes.iter().any(|p| req.path.starts_with(p.as_str()));
+            && cfg
+                .sensitive_prefixes
+                .iter()
+                .any(|p| req.path.starts_with(p.as_str()));
         // 跳过机器人拦截的路径前缀（机器对机器 API；攻击检测/CC 不受影响）
         // skip_bot_prefixes 来自配置文件（面板保存会写全字段，可能被显式写成空数组），
         // 因此另支持「强制豁免」（内存态，进程内设定后不可被配置覆盖）。
@@ -700,7 +717,9 @@ impl Waf {
                             AttackKind::SqlInjection => crate::stats::BlockKind::SqlInjection,
                             AttackKind::Xss => crate::stats::BlockKind::Xss,
                             AttackKind::PathTraversal => crate::stats::BlockKind::PathTraversal,
-                            AttackKind::CommandInjection => crate::stats::BlockKind::CommandInjection,
+                            AttackKind::CommandInjection => {
+                                crate::stats::BlockKind::CommandInjection
+                            }
                         };
                         return self.blocked(
                             &cfg,
@@ -825,7 +844,11 @@ fn is_static_asset(path: &str) -> bool {
 
 fn brief(s: &str) -> String {
     let t: String = s.chars().take(80).collect();
-    if s.chars().count() > 80 { format!("{t}…") } else { t }
+    if s.chars().count() > 80 {
+        format!("{t}…")
+    } else {
+        t
+    }
 }
 
 /// 拦截日志去重器：同「IP + 原因」在 1 秒窗口内只放行一条日志。
@@ -960,7 +983,8 @@ mod tests {
 
         let ts = dhrust::times::getmilltimestamp().to_string();
         let nonce = "n-123456";
-        let sig = dhrust::sign::create_signature(ts.clone(), nonce.to_string(), "s3cret".to_string());
+        let sig =
+            dhrust::sign::create_signature(ts.clone(), nonce.to_string(), "s3cret".to_string());
         let signed = hreq(
             "POST",
             vec![
@@ -988,7 +1012,10 @@ mod tests {
         // 跨源 Origin → 403
         let v = waf.check_http(&hreq(
             "POST",
-            vec![("Origin", "https://evil.example"), ("Host", "127.0.0.1:5501")],
+            vec![
+                ("Origin", "https://evil.example"),
+                ("Host", "127.0.0.1:5501"),
+            ],
         ));
         assert_eq!(v.blocked_status(), Some(403));
         // Origin: null（file:// / 沙盒）→ 403
@@ -1027,9 +1054,12 @@ mod tests {
         assert!(waf.check(&wreq("/")).is_allow());
         // 搜索引擎 / GEO-AI / 社交预览放行
         let mut r = wreq("/cards");
-        r.user_agent = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)".into();
+        r.user_agent =
+            "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)".into();
         assert!(waf.check(&r).is_allow());
-        r.user_agent = "Mozilla/5.0 AppleWebKit/537.36; compatible; GPTBot/1.2; +https://openai.com/gptbot".into();
+        r.user_agent =
+            "Mozilla/5.0 AppleWebKit/537.36; compatible; GPTBot/1.2; +https://openai.com/gptbot"
+                .into();
         assert!(waf.check(&r).is_allow());
         r.user_agent = "ClaudeBot/1.0".into();
         assert!(waf.check(&r).is_allow());
@@ -1050,9 +1080,17 @@ mod tests {
         let waf = Waf::new(WafConfig::public_site());
         let mut r = wreq("/admin/");
         r.user_agent = "Mozilla/5.0 (compatible; Googlebot/2.1)".into();
-        assert_eq!(waf.check(&r).blocked_status(), Some(403), "敏感路径禁止搜索引擎");
+        assert_eq!(
+            waf.check(&r).blocked_status(),
+            Some(403),
+            "敏感路径禁止搜索引擎"
+        );
         r.user_agent = "SomeRandomBot/0.1".into();
-        assert_eq!(waf.check(&r).blocked_status(), Some(403), "敏感路径禁止未知 bot");
+        assert_eq!(
+            waf.check(&r).blocked_status(),
+            Some(403),
+            "敏感路径禁止未知 bot"
+        );
         // 普通浏览器可访问管理页（登录保护由业务层负责）
         r.user_agent = "Mozilla/5.0 Chrome/126.0".into();
         assert!(waf.check(&r).is_allow());
@@ -1066,7 +1104,11 @@ mod tests {
         assert_eq!(waf.check(&r).blocked_status(), Some(403), "SQL 注入拦截");
         // 路径探测
         let r = wreq("/wp-login.php");
-        assert_eq!(waf.check(&r).blocked_status(), Some(403), "敏感路径探测拦截");
+        assert_eq!(
+            waf.check(&r).blocked_status(),
+            Some(403),
+            "敏感路径探测拦截"
+        );
         // XSS 默认仅记录（放行）
         let mut r = wreq("/search");
         r.query = "q=<script>alert(1)</script>".into();
@@ -1074,7 +1116,11 @@ mod tests {
         // 敏感前缀下 Monitor → Block
         let mut r = wreq("/admin/x");
         r.query = "q=<script>alert(1)</script>".into();
-        assert_eq!(waf.check(&r).blocked_status(), Some(403), "敏感前缀 XSS 升级拦截");
+        assert_eq!(
+            waf.check(&r).blocked_status(),
+            Some(403),
+            "敏感前缀 XSS 升级拦截"
+        );
         // 正常中文搜索不误报
         let mut r = wreq("/cards");
         r.query = "q=%E6%8B%9B%E5%95%86%E9%93%B6%E8%A1%8C&page=1".into();
@@ -1091,7 +1137,11 @@ mod tests {
         let mut strict = WafConfig::admin_api();
         strict.block_empty_ua = true;
         let waf_strict = Waf::new(strict);
-        assert_eq!(waf_strict.check(&r).blocked_status(), Some(403), "开启后空 UA 拦截");
+        assert_eq!(
+            waf_strict.check(&r).blocked_status(),
+            Some(403),
+            "开启后空 UA 拦截"
+        );
         // 搜索引擎也拦（管理端不放行 bot）
         let mut r = wreq("/api/status");
         r.user_agent = "Googlebot/2.1".into();
@@ -1197,7 +1247,11 @@ mod tests {
         cfg.enable = true;
         cfg.rate_limit_per_min = 2;
         waf.apply_config(cfg).unwrap();
-        assert_eq!(waf.check(&r).blocked_status(), Some(403), "恢复后恶意 UA 拦截");
+        assert_eq!(
+            waf.check(&r).blocked_status(),
+            Some(403),
+            "恢复后恶意 UA 拦截"
+        );
         let s = wreq("/x");
         assert!(waf.check(&s).is_allow());
         assert!(waf.check(&s).is_allow());
@@ -1274,7 +1328,10 @@ mod tests {
 
         // 注册强制豁免后：即便配置显式空也放行
         waf.set_forced_skip_bot_prefixes(vec!["/api".to_string()]);
-        assert!(waf.check(&r).is_allow(), "强制豁免应覆盖配置文件的显式空数组");
+        assert!(
+            waf.check(&r).is_allow(),
+            "强制豁免应覆盖配置文件的显式空数组"
+        );
         assert_eq!(waf.forced_skip_prefixes().0, vec!["/api".to_string()]);
 
         // 前缀之外不受影响
@@ -1286,13 +1343,18 @@ mod tests {
     #[test]
     fn custom_ruleset_blocks() {
         let mut cfg = WafConfig::admin_api();
-        cfg.ruleset = Some(serde_json::from_str(r#"{
+        cfg.ruleset = Some(
+            serde_json::from_str(
+                r#"{
             "Operator": "OrElse",
             "Rules": [
                 { "MemberName": "Path", "Operator": "EndsWith", "Inputs": [".php"] },
                 { "MemberName": "UserAgent", "Operator": "IsBotKind", "TargetValue": "Malicious" }
             ]
-        }"#).unwrap());
+        }"#,
+            )
+            .unwrap(),
+        );
         let waf = Waf::new(cfg);
         assert_eq!(waf.check(&wreq("/x.php")).blocked_status(), Some(403));
         let mut r = wreq("/api/x");
@@ -1416,7 +1478,11 @@ mod tests {
                 ("user-agent".to_string(), "RestSharp/114.0.0.0".to_string()),
                 ("host".to_string(), "127.0.0.1:5501".to_string()),
             ];
-            headers.extend(extra.into_iter().map(|(k, v)| (k.to_string(), v.to_string())));
+            headers.extend(
+                extra
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string())),
+            );
             dhrust::net::http::HttpRequestHead {
                 method: "POST".to_string(),
                 path: "/api/action".to_string(),
@@ -1428,7 +1494,10 @@ mod tests {
         };
 
         // 未签名 + RestSharp UA（恶意爬虫名单）→ 头阶段 403
-        assert_eq!(waf.check_head_http(&head(vec![])).blocked_status(), Some(403));
+        assert_eq!(
+            waf.check_head_http(&head(vec![])).blocked_status(),
+            Some(403)
+        );
         // 带有效签名 → 头阶段放行
         let signed = head(vec![
             ("TimeStamp", &ts),
@@ -1441,4 +1510,3 @@ mod tests {
         assert_eq!(waf.check_head_http(&cross).blocked_status(), Some(403));
     }
 }
-

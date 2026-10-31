@@ -6,8 +6,8 @@
 //! - 分钟窗口只保留 **6 个桶**（近 6 分钟），`O(1)` 累加、`O(6)` 汇总；
 //! - 快照 `WafStatsSnapshot` 由面板 / `-status` 读取，**不写盘、不发网络、不产生后台线程**。
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Top 表容量（来源 IP 数）。
@@ -133,7 +133,14 @@ impl Default for WafStats {
                 AtomicU64::new(0),
                 AtomicU64::new(0),
             ],
-            window: Mutex::new([const { Bucket { minute: 0, count: 0 } }; WINDOW_BUCKETS]),
+            window: Mutex::new(
+                [const {
+                    Bucket {
+                        minute: 0,
+                        count: 0,
+                    }
+                }; WINDOW_BUCKETS],
+            ),
             top_ips: Mutex::new(Vec::with_capacity(TOP_IP_CAPACITY)),
         }
     }

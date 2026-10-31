@@ -140,7 +140,11 @@ pub enum WhenNull {
 #[serde(rename_all = "camelCase")]
 pub enum ThrottleReturnType {
     /// `DGResult` 信封（`Code/Message/...`，`Code = state::BUSY`）
-    #[serde(alias = "Json_DGResult", alias = "JsonDgResult", alias = "JsonDGResult")]
+    #[serde(
+        alias = "Json_DGResult",
+        alias = "JsonDgResult",
+        alias = "JsonDGResult"
+    )]
     JsonDgResult,
     /// `{"code":99,"msg":"..."}`（对齐 C# `DResult`）
     #[serde(alias = "Json_DResult", alias = "JsonDResult")]
@@ -320,11 +324,7 @@ impl Default for ThrottleRule {
 
 impl ThrottleRule {
     /// 新建规则（`method` 空/`*` = 任意方法；`path` 空/`*` = 任意路径）。
-    pub fn new(
-        method: impl Into<String>,
-        path: impl Into<String>,
-        valves: Vec<RateValve>,
-    ) -> Self {
+    pub fn new(method: impl Into<String>, path: impl Into<String>, valves: Vec<RateValve>) -> Self {
         Self {
             method: method.into(),
             path: path.into(),
@@ -463,8 +463,8 @@ impl ThrottleConfig {
         }
         let template = Self::template_of(self)?;
         let mut cfg = dhrust::config::TomlConfig::from_value(path, &template, self.clone());
-        let rules = serde_json::to_value(&self.rules)
-            .map_err(|e| format!("序列化限流规则失败：{e}"))?;
+        let rules =
+            serde_json::to_value(&self.rules).map_err(|e| format!("序列化限流规则失败：{e}"))?;
         let empty = Vec::new();
         let entries = rules.as_array().unwrap_or(&empty);
         cfg.save_with_arrays(&[("rules", entries)])
@@ -479,8 +479,8 @@ impl ThrottleConfig {
             trust_forwarded_for: cfg.trust_forwarded_for,
             skip_paths: &cfg.skip_paths,
         };
-        let body = toml::to_string_pretty(&scalars)
-            .map_err(|e| format!("序列化限流配置失败：{e}"))?;
+        let body =
+            toml::to_string_pretty(&scalars).map_err(|e| format!("序列化限流配置失败：{e}"))?;
         let mut out = String::with_capacity(CONFIG_HEADER.len() + body.len() + 16);
         out.push_str(CONFIG_HEADER);
         out.push('\n');
@@ -579,10 +579,7 @@ impl Throttle {
     }
 
     /// 以内存配置 + 自定义计数引擎构建。
-    pub fn with_config_and_limiter(
-        config: ThrottleConfig,
-        limiter: WindowLimiter,
-    ) -> Arc<Self> {
+    pub fn with_config_and_limiter(config: ThrottleConfig, limiter: WindowLimiter) -> Arc<Self> {
         let mut config = config;
         normalize_config(&mut config);
         let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -729,9 +726,8 @@ impl Throttle {
                 self.stamp_mtime(&file);
             }
             Err(e) => {
-                dhrust::logs::log().warn(&format!(
-                    "[RateLimiter] 配置热重载失败（保留旧配置）：{e}"
-                ));
+                dhrust::logs::log()
+                    .warn(&format!("[RateLimiter] 配置热重载失败（保留旧配置）：{e}"));
             }
         }
     }
@@ -742,10 +738,7 @@ impl Throttle {
     }
 
     /// 自定义用户身份提取（默认读取 `Ctx.state` 的常用用户键）。
-    pub fn set_user_identity(
-        &self,
-        f: impl Fn(&Ctx) -> Option<String> + Send + Sync + 'static,
-    ) {
+    pub fn set_user_identity(&self, f: impl Fn(&Ctx) -> Option<String> + Send + Sync + 'static) {
         set_hook(&self.user_identity, Arc::new(f));
     }
 
@@ -767,7 +760,8 @@ impl Throttle {
             && let Ok(t) = meta.modified()
             && let Ok(d) = t.duration_since(std::time::UNIX_EPOCH)
         {
-            self.last_mtime.store(d.as_millis() as u64, Ordering::Relaxed);
+            self.last_mtime
+                .store(d.as_millis() as u64, Ordering::Relaxed);
         }
     }
 
@@ -836,9 +830,7 @@ impl Throttle {
             if !rule_matches(rule, &ctx.req.method, &ctx.req.path) {
                 continue;
             }
-            if let Some(info) =
-                self.check_rule(&cfg, rule, ctx, &ip, ip_numeric.as_deref())
-            {
+            if let Some(info) = self.check_rule(&cfg, rule, ctx, &ip, ip_numeric.as_deref()) {
                 return ThrottleVerdict::Limited(info);
             }
         }
@@ -1034,11 +1026,7 @@ impl Throttle {
     ///
     /// 与 [`Throttle::middleware`] 同时使用时，同一路由会被配置规则与本规则**各计一次**
     /// （如需叠加多策略，建议全部写进一条规则的多阀门，避免重复计数）。
-    pub fn guard(
-        self: &Arc<Self>,
-        rule: ThrottleRule,
-        handler: RouteHandler,
-    ) -> RouteHandler {
+    pub fn guard(self: &Arc<Self>, rule: ThrottleRule, handler: RouteHandler) -> RouteHandler {
         let engine = Arc::clone(self);
         let mut rule = rule;
         normalize_rule(&mut rule);
@@ -1133,10 +1121,7 @@ fn rule_matches(rule: &ThrottleRule, method: &str, path: &str) -> bool {
         return false;
     }
     let rule_method = rule.method.trim();
-    if !rule_method.is_empty()
-        && rule_method != "*"
-        && !rule_method.eq_ignore_ascii_case(method)
-    {
+    if !rule_method.is_empty() && rule_method != "*" && !rule_method.eq_ignore_ascii_case(method) {
         return false;
     }
     path_matches(&rule.path, path)
@@ -1231,14 +1216,12 @@ fn query_value(ctx: &Ctx, name: &str) -> Option<String> {
     if name.is_empty() {
         return None;
     }
-    ctx.query_value(name)
-        .map(str::to_string)
-        .or_else(|| {
-            ctx.query
-                .iter()
-                .find(|(key, _)| key.eq_ignore_ascii_case(name))
-                .map(|(_, value)| value.clone())
-        })
+    ctx.query_value(name).map(str::to_string).or_else(|| {
+        ctx.query
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    })
 }
 
 fn form_value(ctx: &Ctx, name: &str) -> Option<String> {
@@ -1359,10 +1342,8 @@ mod tests {
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "pek-rwaf-throttle-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("pek-rwaf-throttle-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("建目录");
         dir
@@ -1376,7 +1357,11 @@ mod tests {
             vec![RateValve::ip(2, 60)],
         )]);
         for _ in 0..2 {
-            assert!(throttle.check(&make_ctx("GET", "/api/ip", &[], "", "8.8.8.8")).is_allow());
+            assert!(
+                throttle
+                    .check(&make_ctx("GET", "/api/ip", &[], "", "8.8.8.8"))
+                    .is_allow()
+            );
         }
         let info = throttle
             .check(&make_ctx("GET", "/api/ip", &[], "", "8.8.8.8"))
@@ -1388,7 +1373,11 @@ mod tests {
         assert_eq!(info.limit, 2);
         assert!(info.retry_after <= Duration::from_secs(60));
         // 不同 IP 独立
-        assert!(throttle.check(&make_ctx("GET", "/api/ip", &[], "", "9.9.9.9")).is_allow());
+        assert!(
+            throttle
+                .check(&make_ctx("GET", "/api/ip", &[], "", "9.9.9.9"))
+                .is_allow()
+        );
     }
 
     #[test]
@@ -1407,7 +1396,11 @@ mod tests {
         assert!(!rule_matches(&rule, "GET", "/api/login"));
         assert!(rule_matches(&rule, "post", "/API/LOGIN"));
         assert!(!rule_matches(&rule, "POST", "/api/logout"));
-        assert!(!rule_matches(&rule.clone().enabled(false), "POST", "/api/login"));
+        assert!(!rule_matches(
+            &rule.clone().enabled(false),
+            "POST",
+            "/api/login"
+        ));
     }
 
     #[test]
@@ -1437,9 +1430,7 @@ mod tests {
         let throttle = Throttle::with_rules(vec![ThrottleRule::new(
             "GET",
             "/api/intercept",
-            vec![
-                RateValve::header("X-Key", 1, 60).when_null(WhenNull::Intercept),
-            ],
+            vec![RateValve::header("X-Key", 1, 60).when_null(WhenNull::Intercept)],
         )]);
         assert!(
             throttle
@@ -1556,14 +1547,8 @@ mod tests {
             vec![RateValve::form("uid", 1, 60)],
         )]);
         assert!(
-            form.check(&make_ctx(
-                "POST",
-                "/api/form",
-                &[],
-                "uid=u1&x=1",
-                "7.7.7.7"
-            ))
-            .is_allow()
+            form.check(&make_ctx("POST", "/api/form", &[], "uid=u1&x=1", "7.7.7.7"))
+                .is_allow()
         );
         assert!(
             !form
@@ -1622,15 +1607,7 @@ mod tests {
             vec![RateValve::user_identity(1, 60)],
         )]);
         custom.set_user_identity(|ctx| ctx.header("X-User").map(str::to_string));
-        let h = |user: &str| {
-            make_ctx(
-                "GET",
-                "/api/user",
-                &[("X-User", user)],
-                "",
-                "9.9.9.9",
-            )
-        };
+        let h = |user: &str| make_ctx("GET", "/api/user", &[("X-User", user)], "", "9.9.9.9");
         assert!(custom.check(&h("alice")).is_allow());
         assert!(!custom.check(&h("alice")).is_allow());
         assert!(custom.check(&h("bob")).is_allow());
@@ -1737,7 +1714,11 @@ mod tests {
         assert_eq!(loaded.key_prefix, "test");
         assert_eq!(loaded.rules.len(), 1);
         assert_eq!(loaded.rules[0].valves.len(), 2);
-        assert_eq!(loaded.rules[0].valves[0].policy, Policy::Header, "高优先级阀门应在前");
+        assert_eq!(
+            loaded.rules[0].valves[0].policy,
+            Policy::Header,
+            "高优先级阀门应在前"
+        );
         assert_eq!(loaded.rules[0].valves[1].limit, 3);
         assert_eq!(loaded.rules[0].valves[1].duration, 120);
 
@@ -1873,15 +1854,7 @@ mod tests {
             "/api/space",
             vec![RateValve::header("X-Key", 1, 60)],
         )]);
-        let c = || {
-            make_ctx(
-                "GET",
-                "/api/space",
-                &[("X-Key", "   ")],
-                "",
-                "4.4.4.4",
-            )
-        };
+        let c = || make_ctx("GET", "/api/space", &[("X-Key", "   ")], "", "4.4.4.4");
         assert!(throttle.check(&c()).is_allow());
         assert!(
             !throttle.check(&c()).is_allow(),
@@ -1896,18 +1869,8 @@ mod tests {
             "/api/hook",
             vec![RateValve::ip(1, 60)],
         )]);
-        throttle.set_client_ip(|ctx| {
-            ctx.header("X-Real-IP").unwrap_or("unknown").to_string()
-        });
-        let c = |ip: &str| {
-            make_ctx(
-                "GET",
-                "/api/hook",
-                &[("X-Real-IP", ip)],
-                "",
-                "9.9.9.9",
-            )
-        };
+        throttle.set_client_ip(|ctx| ctx.header("X-Real-IP").unwrap_or("unknown").to_string());
+        let c = |ip: &str| make_ctx("GET", "/api/hook", &[("X-Real-IP", ip)], "", "9.9.9.9");
         assert!(throttle.check(&c("1.1.1.1")).is_allow());
         assert!(!throttle.check(&c("1.1.1.1")).is_allow());
         assert!(throttle.check(&c("2.2.2.2")).is_allow());

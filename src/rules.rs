@@ -49,10 +49,7 @@ pub struct Rule {
 #[derive(Debug)]
 pub enum Compiled {
     /// 逻辑组合（`and = true` 为 AndAlso）
-    Logical {
-        and: bool,
-        children: Vec<Compiled>,
-    },
+    Logical { and: bool, children: Vec<Compiled> },
     /// 叶子条件
     Leaf {
         /// 人类可读描述（日志）
@@ -127,7 +124,14 @@ fn compile_inner(rule: &Rule, base_dir: &std::path::Path) -> Result<Compiled, St
         None
     };
 
-    let label = format!("{member}/{op}{}", if target.is_empty() { String::new() } else { format!("({target})") });
+    let label = format!(
+        "{member}/{op}{}",
+        if target.is_empty() {
+            String::new()
+        } else {
+            format!("({target})")
+        }
+    );
     Ok(Compiled::Leaf {
         label,
         member,
@@ -180,10 +184,18 @@ fn eval_leaf(
     let ua_lower = user_agent.to_ascii_lowercase();
     let eq_i = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
     match op {
-        "endswith" => inputs.iter().any(|i| lower.ends_with(&i.to_ascii_lowercase())),
-        "startswith" => inputs.iter().any(|i| lower.starts_with(&i.to_ascii_lowercase())),
-        "contains" => inputs.iter().any(|i| lower.contains(&i.to_ascii_lowercase())),
-        "equals" | "equal" => inputs.iter().any(|i| eq_i(value, i)) || (!target.is_empty() && eq_i(value, target)),
+        "endswith" => inputs
+            .iter()
+            .any(|i| lower.ends_with(&i.to_ascii_lowercase())),
+        "startswith" => inputs
+            .iter()
+            .any(|i| lower.starts_with(&i.to_ascii_lowercase())),
+        "contains" => inputs
+            .iter()
+            .any(|i| lower.contains(&i.to_ascii_lowercase())),
+        "equals" | "equal" => {
+            inputs.iter().any(|i| eq_i(value, i)) || (!target.is_empty() && eq_i(value, target))
+        }
         "ismatch" => regex.as_ref().map(|r| r.is_match(value)).unwrap_or(false),
         "isinput" => inputs.iter().any(|i| eq_i(value, i)),
         "isinteger" => value.trim().parse::<i64>().is_ok(),
@@ -192,13 +204,7 @@ fn eval_leaf(
     }
 }
 
-fn eval_ext(
-    op: &str,
-    inputs: &[String],
-    target: &str,
-    value: &str,
-    ua_lower: &str,
-) -> bool {
+fn eval_ext(op: &str, inputs: &[String], target: &str, value: &str, ua_lower: &str) -> bool {
     match op {
         // —— IP 系（成员为 RemoteIp/IpAddress 时）——
         "isiniplist" => ip_in_list(value, &inputs.join(",")),
@@ -210,11 +216,17 @@ fn eval_ext(
         }
         "ipinfile" => ip_in_list(value, &inputs.join(",")),
         // —— UA 系（对 UserAgent 成员操作，忽略大小写）——
-        "containsuseragent" => inputs.iter().any(|i| ua_lower.contains(&i.to_ascii_lowercase())),
-        "notcontainsuseragent" => !inputs.iter().any(|i| ua_lower.contains(&i.to_ascii_lowercase())),
+        "containsuseragent" => inputs
+            .iter()
+            .any(|i| ua_lower.contains(&i.to_ascii_lowercase())),
+        "notcontainsuseragent" => !inputs
+            .iter()
+            .any(|i| ua_lower.contains(&i.to_ascii_lowercase())),
         "isinuseragentlist" => inputs.iter().any(|i| ua_lower == i.to_ascii_lowercase()),
         "isnotinuseragentlist" => !inputs.iter().any(|i| ua_lower == i.to_ascii_lowercase()),
-        "useragentstartswith" => inputs.iter().any(|i| ua_lower.starts_with(&i.to_ascii_lowercase())),
+        "useragentstartswith" => inputs
+            .iter()
+            .any(|i| ua_lower.starts_with(&i.to_ascii_lowercase())),
         "useragentisempty" => ua_lower.trim().is_empty(),
         "useragentisnotempty" => !ua_lower.trim().is_empty(),
         // —— 扩展：按爬虫分类命中 ——
@@ -222,7 +234,10 @@ fn eval_ext(
             let wanted = if !target.is_empty() {
                 target.to_ascii_lowercase()
             } else {
-                inputs.first().map(|i| i.to_ascii_lowercase()).unwrap_or_default()
+                inputs
+                    .first()
+                    .map(|i| i.to_ascii_lowercase())
+                    .unwrap_or_default()
             };
             match bots::classify(value) {
                 Some(k) => match wanted.as_str() {
@@ -310,7 +325,8 @@ mod tests {
         r.remote_ip = "8.8.8.8".to_string();
         assert!(!eval(&c, &r));
 
-        let json = r#"{ "MemberName": "UserAgent", "Operator": "IsBotKind", "TargetValue": "Malicious" }"#;
+        let json =
+            r#"{ "MemberName": "UserAgent", "Operator": "IsBotKind", "TargetValue": "Malicious" }"#;
         let rule: Rule = serde_json::from_str(json).unwrap();
         let c = compile(&rule, std::path::Path::new(".")).unwrap();
         assert!(eval(&c, &req("MJ12bot/v1.4")));
