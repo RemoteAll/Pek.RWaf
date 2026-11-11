@@ -175,18 +175,124 @@ fn hit(text: &str, patterns: &[&str]) -> bool {
     patterns.iter().any(|p| text.contains(p))
 }
 
-/// 只做「路径穿越 / 敏感路径」检测。
+/// 攻击类别位（与 [`AttackKind`] 一一对应）。
+///
+/// 为什么要位而不是 `Vec`：位是 `Copy`，可以直接进 [`dhrust::cache::TinyMemo`] 做
+/// 「同一 path+query 的扫描结果」缓存；`Vec` 每次都要分配。
+pub const K_SQLI: u8 = 1;
+/// 路径穿越位。
+pub const K_PATH: u8 = 2;
+/// 命令注入位。
+pub const K_CMD: u8 = 4;
+/// XSS 位。
+pub const K_XSS: u8 = 8;
+const K_ALL: u8 = K_SQLI | K_PATH | K_CMD | K_XSS;
+
+thread_local! {
+    /// 每线程复用的两片缓冲：`(解码用, 规范化用)`。
+    ///
+    /// 规范化是每请求都要做的事（路径 + 查询串 + body），每次都新建 `Vec` 纯属浪费；
+    /// 复用后稳态零分配。重入时（同线程嵌套调用）退回临时缓冲，见 [`with_norm_buffers`]。
+    static NORM_BUFS: std::cell::RefCell<(Vec<u8>, Vec<u8>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// 取复用缓冲执行闭包（重入时用临时缓冲兜底，保证不 panic）。
+fn with_norm_buffers<R>(f: impl FnOnce(&mut Vec<u8>, &mut Vec<u8>) -> R) -> R {
+    NORM_BUFS.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut bufs) => {
+            let (decoded, norm) = &mut *bufs;
+            f(decoded, norm)
+        }
+        Err(_) => {
+            let mut tmp = (Vec::new(), Vec::new());
+            let (decoded, norm) = &mut tmp;
+            f(decoded, norm)
+        }
+    })
+}
+
+/// 规范化多段文本并返回命中的类别位（`mask` 限定只查哪几类）。
+///
+/// 与 [`normalize_parts`] 的差异：结果写进复用缓冲，**稳态零分配**；
+/// 只返回位掩码，避免为「无命中」（绝大多数请求）也分配一个空 `Vec`。
+fn scan_bits(parts: &[&str], mask: u8) -> u8 {
+    with_norm_buffers(|decoded, norm| {
+        // 用 `str::contains(char)`（memchr）判是否需要解码；手写字节循环慢一个量级
+        if parts.iter().any(|p| p.contains('%') || p.contains('+')) {
+            decoded.clear();
+            for p in parts {
+                dhrust::web::percent_decode_into(p.as_bytes(), decoded, true);
+            }
+            if decoded.contains(&b'%') {
+                // 覆盖双重编码：保留「解一次」形态，再追加「解两次」形态
+                let mut twice: Vec<u8> = Vec::with_capacity(decoded.len() + 1);
+                dhrust::web::percent_decode_into(decoded, &mut twice, true);
+                decoded.push(b' ');
+                decoded.extend_from_slice(&twice);
+            }
+            let text = String::from_utf8_lossy(decoded);
+            dhrust::text::normalize_lower_bytes_into(&[text.as_ref()], norm);
+        } else {
+            dhrust::text::normalize_lower_bytes_into(parts, norm);
+        }
+        let text = std::str::from_utf8(norm).unwrap_or("");
+        bits_of(text, mask)
+    })
+}
+
+/// 在已规范化的文本上跑名单，返回命中的类别位。
+fn bits_of(text: &str, mask: u8) -> u8 {
+    let mut bits = 0u8;
+    if mask & K_SQLI != 0 && hit(text, SQLI_PATTERNS) {
+        bits |= K_SQLI;
+    }
+    if mask & K_PATH != 0 && hit(text, PATH_PATTERNS) {
+        bits |= K_PATH;
+    }
+    if mask & K_CMD != 0 && hit(text, CMD_PATTERNS) {
+        bits |= K_CMD;
+    }
+    if mask & K_XSS != 0 && hit(text, XSS_PATTERNS) {
+        bits |= K_XSS;
+    }
+    bits
+}
+
+/// 类别位 → 类别列表（顺序与原实现一致：SQLi、路径、命令、XSS）。
+pub fn kinds_from_bits(bits: u8) -> Vec<AttackKind> {
+    let mut kinds = Vec::new();
+    if bits & K_SQLI != 0 {
+        kinds.push(AttackKind::SqlInjection);
+    }
+    if bits & K_PATH != 0 {
+        kinds.push(AttackKind::PathTraversal);
+    }
+    if bits & K_CMD != 0 {
+        kinds.push(AttackKind::CommandInjection);
+    }
+    if bits & K_XSS != 0 {
+        kinds.push(AttackKind::Xss);
+    }
+    kinds
+}
+
+/// 只做「路径穿越 / 敏感路径」检测（返回类别位）。
 ///
 /// 静态资源（js/css/图片/字体）专用：这些文件的**内容**天然含有 `' or `、`<script`
 /// 之类片段，跑全量扫描是误报高发区；但路径穿越仍然必须拦。
+pub fn scan_path_bits(path: &str, query: &str) -> u8 {
+    scan_bits(&[path, "?", query], K_PATH)
+}
+
+/// 综合扫描（返回类别位）：规范化一次、跑全部名单。
+pub fn scan_all_bits(path: &str, query: &str, body: &str) -> u8 {
+    scan_bits(&[path, "?", query, " ", body], K_ALL)
+}
+
+/// 只做「路径穿越 / 敏感路径」检测（类别列表形态，供测试与离线场景）。
 pub fn scan_path(path: &str, query: &str) -> Vec<AttackKind> {
-    // 分隔符作为独立段给出：等价 `{path}?{query}`，但不再多分配一个拼接串
-    let text = normalize_parts(&[path, "?", query]);
-    if hit(&text, PATH_PATTERNS) {
-        vec![AttackKind::PathTraversal]
-    } else {
-        Vec::new()
-    }
+    kinds_from_bits(scan_path_bits(path, query))
 }
 
 /// 综合扫描（规范化一次，返回全部命中的类别——便于按策略分别处理）。
@@ -196,21 +302,7 @@ pub fn scan_path(path: &str, query: &str) -> Vec<AttackKind> {
 /// 尝试全部候选反而慢 67%（36.9 µs → 61.6 µs）。真正能在单趟内完成的只有
 /// Aho-Corasick 自动机，收益约 20 µs/16 KB，暂不引入。
 pub fn scan_all(path: &str, query: &str, body: &str) -> Vec<AttackKind> {
-    let text = normalize_parts(&[path, "?", query, " ", body]);
-    let mut kinds = Vec::new();
-    if hit(&text, SQLI_PATTERNS) {
-        kinds.push(AttackKind::SqlInjection);
-    }
-    if hit(&text, PATH_PATTERNS) {
-        kinds.push(AttackKind::PathTraversal);
-    }
-    if hit(&text, CMD_PATTERNS) {
-        kinds.push(AttackKind::CommandInjection);
-    }
-    if hit(&text, XSS_PATTERNS) {
-        kinds.push(AttackKind::Xss);
-    }
-    kinds
+    kinds_from_bits(scan_all_bits(path, query, body))
 }
 
 #[cfg(test)]

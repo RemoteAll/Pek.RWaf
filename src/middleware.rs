@@ -46,6 +46,40 @@ fn with_scratch<R>(f: impl FnOnce(&mut WafRequest) -> R) -> R {
     })
 }
 
+thread_local! {
+    /// 头部阶段攻击扫描的每线程 memo：`(模式, 路径, 查询串)` → 类别位。
+    ///
+    /// 为什么值得缓存：头部检查里扫描要占 **64%** 的时间（实测 672 ns / 1050 ns）——
+    /// 规范化 + 四个名单逐个 `contains`；而真实流量里路径与查询串高度重复
+    /// （同一个接口反复调用），缓存后只剩一次哈希（~40 ns）。
+    /// 扫描结果是 `(path, query)` 的纯函数，名单又是编译期常量，不存在失效问题。
+    static SCAN_MEMO: std::cell::RefCell<dhrust::cache::TinyMemo<u8>> =
+        const { std::cell::RefCell::new(dhrust::cache::TinyMemo::new()) };
+}
+
+/// 取「头部阶段（无 body）」的扫描类别位：同一 `(模式, 路径, 查询串)` 走 memo。
+fn head_scan_bits(path: &str, query: &str, static_asset: bool) -> u8 {
+    let compute = || {
+        if static_asset {
+            attack::scan_path_bits(path, query)
+        } else {
+            attack::scan_all_bits(path, query, "")
+        }
+    };
+    let mut hasher = dhrust::cache::KeyHasher::new(false);
+    hasher.write(&[u8::from(static_asset)]);
+    hasher.write_str(path);
+    // 分隔字节：避免 (a, "bc") 与 (ab, "c") 落到同一个键
+    hasher.write(&[0u8]);
+    hasher.write_str(query);
+    let (hash, len) = hasher.finish();
+    SCAN_MEMO.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut memo) => memo.get_or_insert_hashed(hash, len, compute),
+        // 重入（同线程嵌套检查）：直接算，不进缓存
+        Err(_) => compute(),
+    })
+}
+
 /// 热重载检查间隔（毫秒）。
 const RELOAD_CHECK_INTERVAL_MS: i64 = 10_000;
 
@@ -267,22 +301,25 @@ impl Waf {
         }
     }
 
-    /// 解析真实客户端 IP：`(TCP 对端, X-Forwarded-For)` → 纯 IP 串。
+    /// 解析真实客户端 IP：`(TCP 对端, X-Forwarded-For)` → 写进 `out`（复用缓冲、零分配）。
     ///
-    /// **统一走 `dhrust::net::panel_auth::client_ip_behind_proxy`**（单一实现）：
+    /// **统一走 `dhrust::net::panel_auth::client_ip_behind_proxy_into`**（单一实现）：
     /// 仅在「对端是回环」且开了 `trust_forwarded_for` 时才采纳 XFF，且取的是**最后一跳**
     /// （2026-11-10 安全审计：`$proxy_add_x_forwarded_for` 是追加语义，首段完全由客户端控制，
     /// 取首段等于允许伪造 IP 绕过黑名单/限流）。
-    fn resolve_ip(&self, peer: Option<&str>, xff: Option<&str>) -> String {
-        let mut peer_ip = String::new();
-        crate::wafreq::strip_port_into(peer.unwrap_or(""), &mut peer_ip);
-        dhrust::net::panel_auth::client_ip_behind_proxy(
-            &peer_ip,
+    ///
+    /// `dhrust::net::strip_port` 返回切片（零分配），再由 `client_ip_behind_proxy_into`
+    /// 直接写进目标缓冲——整条链路不产生临时 `String`。
+    fn resolve_ip_into(&self, peer: Option<&str>, xff: Option<&str>, out: &mut String) {
+        let peer_ip = dhrust::net::strip_port(peer.unwrap_or(""));
+        dhrust::net::panel_auth::client_ip_behind_proxy_into(
+            peer_ip,
             xff,
             None,
             "",
             self.trust_forwarded_for(),
-        )
+            out,
+        );
     }
 
     /// 请求签名是否为当前可信业务请求（SHA1(排序后的 timestamp+nonce+secret)）。
@@ -459,9 +496,6 @@ impl Waf {
             }
         };
         let limit = if limit == 0 { 16 * 1024 } else { limit };
-        // 真实 IP：反代后对端恒为回环，开了 `set_trust_forwarded_for` 才采纳 XFF
-        // （否则 WAF 会把所有请求当回环，配合 loopback_bypass 就是整体放行）
-        let resolved_ip = self.resolve_ip(req.remote_addr.as_deref(), req.header("x-forwarded-for"));
         // CSRF/跨站来源校验先于回环豁免：浏览器跨站请求的源 IP 恰是回环（localhost/面板免登录场景防护）。
         // 无 Sec-Fetch-Site 与 Origin 的请求（curl / 服务间调用 / 旧客户端）不进此分支。
         let csrf = csrf_check(req).filter(|_| {
@@ -474,6 +508,15 @@ impl Waf {
         // 复用每线程视图：只做 `push_str` 覆写，不再为每个请求新建 6~7 个 String
         with_scratch(|wreq| {
             wreq.fill_from_http(req);
+            // 真实 IP 直接写进复用缓冲（零分配）：反代后对端恒为回环，
+            // 开了 `set_trust_forwarded_for` 才采纳 XFF（否则 WAF 会把所有请求当回环，
+            // 配合 loopback_bypass 就是整体放行）
+            wreq.remote_ip.clear();
+            self.resolve_ip_into(
+                req.remote_addr.as_deref(),
+                req.header("x-forwarded-for"),
+                &mut wreq.remote_ip,
+            );
             // **只在真要扫 body 时**才复制预览：命中 `skip_attack_prefixes` 的请求
             //（聊天/API 接口）根本不看 body，实测 16 KB body 白拷一份要 ~24 µs。
             if !self.skips_attack(&req.path) {
@@ -482,8 +525,6 @@ impl Waf {
                     wreq.fill_body_preview(&req.body, limit);
                 }
             }
-            wreq.remote_ip.clear();
-            wreq.remote_ip.push_str(&resolved_ip);
             if let Some(reason) = csrf {
                 let cfg = match self.config.read() {
                     Ok(c) => c,
@@ -547,8 +588,6 @@ impl Waf {
         if self.trusted_signed_by(|name| head.header(name)) {
             return Verdict::Allow;
         }
-        let resolved_ip =
-            self.resolve_ip(head.remote_addr.as_deref(), head.header("x-forwarded-for"));
         let csrf = csrf_reason(
             &head.method,
             head.header("sec-fetch-site").unwrap_or(""),
@@ -564,8 +603,13 @@ impl Waf {
         });
         with_scratch(|wreq| {
             wreq.fill_from_head(head);
+            // 真实 IP 直接写进复用缓冲（零分配）
             wreq.remote_ip.clear();
-            wreq.remote_ip.push_str(&resolved_ip);
+            self.resolve_ip_into(
+                head.remote_addr.as_deref(),
+                head.header("x-forwarded-for"),
+                &mut wreq.remote_ip,
+            );
             if let Some(reason) = csrf {
                 let cfg = match self.config.read() {
                     Ok(c) => c,
@@ -748,7 +792,16 @@ impl Waf {
             // 静态资源（js/css/图片/字体）只做「路径穿越 / 敏感路径」检测：
             // 这些文件内容天然含 `' or `、`<script` 之类片段，跑全量特征是误报高发区，
             // 且面板每次加载都要重复扫 N 个文件——省掉这部分每请求的字符串分配。
-            let kinds = if is_static_asset(&req.path) {
+            //
+            // 分三种情况：
+            // 1. **没有 body**（头部早拒 / GET 请求）：按 `(模式, 路径, 查询串)` 走每线程 memo，
+            //    命中就只剩一次哈希（扫描段曾是头部检查的 64%）；
+            // 2. 有 body 且是静态资源：只查路径穿越（不考虑 body）；
+            // 3. 有 body 的普通请求：全量扫描（body 每次不同，缓存无意义）。
+            let is_static = is_static_asset(&req.path);
+            let kinds = if req.body_text.is_empty() {
+                attack::kinds_from_bits(head_scan_bits(&req.path, &req.query, is_static))
+            } else if is_static {
                 attack::scan_path(&req.path, &req.query)
             } else {
                 attack::scan_all(&req.path, &req.query, &req.body_text)
@@ -1188,6 +1241,52 @@ mod tests {
         let mut r = wreq("/cards");
         r.query = "q=%E6%8B%9B%E5%95%86%E9%93%B6%E8%A1%8C&page=1".into();
         assert!(waf.check(&r).is_allow());
+    }
+
+    /// 头部扫描 memo 不能串味：缓存的是 `(模式, 路径, 查询串)`，三者任一不同都必须重新判定。
+    ///
+    /// 这条用例守的是「为了性能缓存判定结果」带来的最危险方向——
+    /// 一旦键构造错了，就可能出现「先请求一个干净 URL，后续同路径的注入被当成干净放过」。
+    #[test]
+    fn head_scan_memo_does_not_cross_contaminate() {
+        let mut cfg = WafConfig::admin_api();
+        cfg.loopback_bypass = false;
+        cfg.rate_limit_per_min = 0;
+        let waf = Waf::new(cfg);
+
+        // 1) 先干净、后注入：第二次必须仍被拦
+        let ok = hreq("GET", vec![]); // /api/action，无查询串
+        assert!(waf.check_http(&ok).is_allow());
+        assert!(waf.check_http(&ok).is_allow(), "第二次仍应放行（走 memo）");
+        let mut bad = hreq("GET", vec![]);
+        bad.query = "q=1' or 1=1--".to_string();
+        assert_eq!(
+            waf.check_http(&bad).blocked_status(),
+            Some(403),
+            "同路径但查询串不同，不能复用「干净」结果"
+        );
+
+        // 2) 先注入、后干净：干净请求不能被连坐
+        assert_eq!(waf.check_http(&bad).blocked_status(), Some(403));
+        assert!(waf.check_http(&ok).is_allow(), "干净请求不能被注入结果连坐");
+
+        // 3) 静态资源模式（只查路径穿越）与普通模式不能混
+        let mut xss_static = hreq("GET", vec![]);
+        xss_static.path = "/static/app.js".to_string();
+        xss_static.query = "q=<script>alert(1)</script>".to_string();
+        assert!(
+            waf.check_http(&xss_static).is_allow(),
+            "静态资源不查 XSS（设计如此）"
+        );
+        let mut xss_normal = hreq("GET", vec![]);
+        xss_normal.path = "/search".to_string();
+        xss_normal.query = "q=<script>alert(1)</script>".to_string();
+        // admin_api 预设下 XSS 是拦截；关键是「不是被静态模式的结果污染成放行」
+        assert_eq!(
+            waf.check_http(&xss_normal).blocked_status(),
+            Some(403),
+            "普通路径要查 XSS，不能被静态模式缓存污染"
+        );
     }
 
     #[test]
@@ -1809,5 +1908,89 @@ mod tests {
                 ms_1m / 1000.0
             );
         }
+    }
+
+    /// 基准：`check_head_http` 各段成本拆解（回答「还有哪里能提速」）。
+    ///
+    /// 手动跑：`cargo test --release --lib bench_head_http_breakdown -- --ignored --nocapture`
+    #[test]
+    #[ignore = "bench（手动运行）"]
+    fn bench_head_http_breakdown() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const N: usize = 300_000;
+        let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0";
+
+        let base = || {
+            let mut cfg = WafConfig::admin_api();
+            cfg.loopback_bypass = false;
+            cfg.rate_limit_per_min = 0;
+            cfg.csrf_guard = false;
+            cfg
+        };
+        // A：不豁免攻击扫描（走 normalize + 4 名单匹配）
+        let waf_scan = Waf::new(base());
+        // B：整站豁免攻击扫描（等于把扫描成本摘掉）
+        let mut cfg_skip = base();
+        cfg_skip.skip_attack_prefixes = vec!["/".to_string()];
+        let waf_skip = Waf::new(cfg_skip);
+
+        let head = dhrust::net::http::HttpRequestHead {
+            method: "GET".to_string(),
+            path: "/panel/overview".to_string(),
+            query: "tab=1&page=2".to_string(),
+            headers: vec![
+                ("User-Agent".to_string(), ua.to_string()),
+                ("Host".to_string(), "panel.example.com".to_string()),
+            ],
+            remote_addr: Some("203.0.113.7:51234".to_string()),
+            content_length: None,
+        };
+
+        let measure = |waf: &Waf| -> f64 {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let started = Instant::now();
+                for _ in 0..N {
+                    black_box(waf.check_head_http(&head));
+                }
+                best = best.min(started.elapsed().as_nanos() as f64 / N as f64);
+            }
+            best
+        };
+        let with_scan = measure(&waf_scan);
+        let without_scan = measure(&waf_skip);
+        println!(
+            "check_head_http：含攻击扫描 {with_scan:.0} ns；摘掉扫描 {without_scan:.0} ns；\
+             扫描段 {:.0} ns（占 {:.0}%）",
+            with_scan - without_scan,
+            (with_scan - without_scan) / with_scan * 100.0
+        );
+
+        // IP 解析（每请求 2 次分配 → 现在零分配）单独量
+        let mut ip_out = String::new();
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let started = Instant::now();
+            for _ in 0..N {
+                waf_scan.resolve_ip_into(Some("203.0.113.7:51234"), None, &mut ip_out);
+                black_box(&ip_out);
+            }
+            best = best.min(started.elapsed().as_nanos() as f64 / N as f64);
+        }
+        println!("resolve_ip_into：{best:.0} ns/次");
+
+        // UA 分类（命中缓存）
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let started = Instant::now();
+            for _ in 0..N {
+                black_box(bots::classify_cached(ua));
+            }
+            best = best.min(started.elapsed().as_nanos() as f64 / N as f64);
+        }
+        println!("classify_cached（命中）：{best:.0} ns/次");
+        assert!(with_scan > 0.0);
     }
 }
