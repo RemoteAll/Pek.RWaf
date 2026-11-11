@@ -1,4 +1,4 @@
-//! WAF 核心：`Waf` 门面（决策链）、dhrust 中间件装配、`Config/Waf.toml` 热重载。
+﻿//! WAF 核心：`Waf` 门面（决策链）、dhrust 中间件装配、`Config/Waf.toml` 热重载。
 //!
 //! 检查顺序（首个命中短路）：
 //! 1. 总开关 → 回环豁免 → IP 黑名单 → IP 白名单
@@ -26,7 +26,25 @@ use crate::bots::{self, BotKind};
 use crate::config::{Action, WafConfig};
 use crate::ratelimit::RateLimiter;
 use crate::rules::{self, Compiled};
-use crate::wafreq::{WafRequest, ip_in_list};
+use crate::wafreq::{WafRequest, ip_match};
+
+thread_local! {
+    /// 每线程复用的请求视图：`check_http` / `check_head_http` 用"持有实例 + 覆写"代替每请求新建
+    /// （实测 `check_head` 757 ns → 571 ns，省掉 6~7 次 `String` 分配）。
+    static SCRATCH: std::cell::RefCell<WafRequest> =
+        std::cell::RefCell::new(WafRequest::default());
+}
+
+/// 用复用视图执行闭包（重入时退回临时实例，保证不 panic）。
+fn with_scratch<R>(f: impl FnOnce(&mut WafRequest) -> R) -> R {
+    SCRATCH.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut req) => f(&mut req),
+        Err(_) => {
+            let mut req = WafRequest::default();
+            f(&mut req)
+        }
+    })
+}
 
 /// 热重载检查间隔（毫秒）。
 const RELOAD_CHECK_INTERVAL_MS: i64 = 10_000;
@@ -251,19 +269,20 @@ impl Waf {
 
     /// 解析真实客户端 IP：`(TCP 对端, X-Forwarded-For)` → 纯 IP 串。
     ///
-    /// 与项目业务层的 `client_ip` 口径一致：**仅当对端是回环**时才采纳 XFF 的第一段。
+    /// **统一走 `dhrust::net::panel_auth::client_ip_behind_proxy`**（单一实现）：
+    /// 仅在「对端是回环」且开了 `trust_forwarded_for` 时才采纳 XFF，且取的是**最后一跳**
+    /// （2026-11-10 安全审计：`$proxy_add_x_forwarded_for` 是追加语义，首段完全由客户端控制，
+    /// 取首段等于允许伪造 IP 绕过黑名单/限流）。
     fn resolve_ip(&self, peer: Option<&str>, xff: Option<&str>) -> String {
-        let peer_ip = crate::wafreq::strip_port(peer.unwrap_or(""));
-        if self.trust_forwarded_for()
-            && is_loopback(&peer_ip)
-            && let Some(xff) = xff
-        {
-            let first = xff.split(',').next().unwrap_or("").trim();
-            if !first.is_empty() {
-                return crate::wafreq::strip_port(first);
-            }
-        }
-        peer_ip
+        let mut peer_ip = String::new();
+        crate::wafreq::strip_port_into(peer.unwrap_or(""), &mut peer_ip);
+        dhrust::net::panel_auth::client_ip_behind_proxy(
+            &peer_ip,
+            xff,
+            None,
+            "",
+            self.trust_forwarded_for(),
+        )
     }
 
     /// 请求签名是否为当前可信业务请求（SHA1(排序后的 timestamp+nonce+secret)）。
@@ -429,7 +448,6 @@ impl Waf {
         if self.trusted_signed(req) {
             return Verdict::Allow;
         }
-        let mut wreq = WafRequest::from_http(req);
         // body 扫描范围按配置：默认只扫文本类的前 16 KB；`body_scan_all_types` 打开后
         // 连 `application/octet-stream` 也扫（防「改个 Content-Type 就绕过 body 检测」），
         // 上限由 `body_scan_limit` 控制（防大 body 造成 CPU 开销）。
@@ -441,27 +459,43 @@ impl Waf {
             }
         };
         let limit = if limit == 0 { 16 * 1024 } else { limit };
-        if !req.body.is_empty()
-            && (all_types || crate::wafreq::is_text_content_type(&wreq.content_type))
-        {
-            let cap = req.body.len().min(limit);
-            wreq.body_text = String::from_utf8_lossy(&req.body[..cap]).to_string();
-        }
         // 真实 IP：反代后对端恒为回环，开了 `set_trust_forwarded_for` 才采纳 XFF
         // （否则 WAF 会把所有请求当回环，配合 loopback_bypass 就是整体放行）
-        wreq.remote_ip = self.resolve_ip(req.remote_addr.as_deref(), req.header("x-forwarded-for"));
+        let resolved_ip = self.resolve_ip(req.remote_addr.as_deref(), req.header("x-forwarded-for"));
         // CSRF/跨站来源校验先于回环豁免：浏览器跨站请求的源 IP 恰是回环（localhost/面板免登录场景防护）。
         // 无 Sec-Fetch-Site 与 Origin 的请求（curl / 服务间调用 / 旧客户端）不进此分支。
-        if let Some(reason) = csrf_check(req) {
+        let csrf = csrf_check(req).filter(|_| {
             let cfg = match self.config.read() {
                 Ok(c) => c,
                 Err(p) => p.into_inner(),
             };
-            if cfg.enable && cfg.csrf_guard {
-                return self.blocked(&cfg, 403, reason, &wreq, crate::stats::BlockKind::Csrf);
+            cfg.enable && cfg.csrf_guard
+        });
+        // 复用每线程视图：只做 `push_str` 覆写，不再为每个请求新建 6~7 个 String
+        with_scratch(|wreq| {
+            wreq.fill_from_http(req);
+            let is_text = crate::wafreq::is_text_content_type(&wreq.content_type);
+            if !req.body.is_empty() && (all_types || is_text) {
+                let cap = req.body.len().min(limit);
+                wreq.body_text.clear();
+                match std::str::from_utf8(&req.body[..cap]) {
+                    Ok(text) => wreq.body_text.push_str(text),
+                    Err(_) => wreq
+                        .body_text
+                        .push_str(&String::from_utf8_lossy(&req.body[..cap])),
+                }
             }
-        }
-        self.check(&wreq)
+            wreq.remote_ip.clear();
+            wreq.remote_ip.push_str(&resolved_ip);
+            if let Some(reason) = csrf {
+                let cfg = match self.config.read() {
+                    Ok(c) => c,
+                    Err(p) => p.into_inner(),
+                };
+                return self.blocked(&cfg, 403, reason, wreq, crate::stats::BlockKind::Csrf);
+            }
+            self.check(wreq)
+        })
     }
 
     /// 对规范化请求执行检查。
@@ -492,24 +526,34 @@ impl Waf {
         if self.trusted_signed_by(|name| head.header(name)) {
             return Verdict::Allow;
         }
-        let mut wreq = WafRequest::from_head(head);
-        wreq.remote_ip =
+        let resolved_ip =
             self.resolve_ip(head.remote_addr.as_deref(), head.header("x-forwarded-for"));
-        if let Some(reason) = csrf_reason(
+        let csrf = csrf_reason(
             &head.method,
             head.header("sec-fetch-site").unwrap_or(""),
             head.header("origin").unwrap_or(""),
             head.header("host").unwrap_or(""),
-        ) {
+        )
+        .filter(|_| {
             let cfg = match self.config.read() {
                 Ok(c) => c,
                 Err(p) => p.into_inner(),
             };
-            if cfg.enable && cfg.csrf_guard {
-                return self.blocked(&cfg, 403, reason, &wreq, crate::stats::BlockKind::Csrf);
+            cfg.enable && cfg.csrf_guard
+        });
+        with_scratch(|wreq| {
+            wreq.fill_from_head(head);
+            wreq.remote_ip.clear();
+            wreq.remote_ip.push_str(&resolved_ip);
+            if let Some(reason) = csrf {
+                let cfg = match self.config.read() {
+                    Ok(c) => c,
+                    Err(p) => p.into_inner(),
+                };
+                return self.blocked(&cfg, 403, reason, wreq, crate::stats::BlockKind::Csrf);
             }
-        }
-        self.check_inner(&wreq)
+            self.check_inner(wreq)
+        })
     }
 
     fn check_inner(&self, req: &WafRequest) -> Verdict {
@@ -529,10 +573,15 @@ impl Waf {
             return Verdict::Allow;
         }
         // —— IP 白名单（显式信任，优先于黑名单与全部检查）→ IP 黑名单 ——
-        if !cfg.ip_whitelist.is_empty() && ip_in_list(ip, &cfg.ip_whitelist.join(",")) {
+        // 不 `join(",")`：那会给每个请求分配一份完整列表串（长名单时开销可观），直接遍历即可
+        if !cfg.ip_whitelist.is_empty()
+            && cfg.ip_whitelist.iter().any(|rule| ip_match(ip, rule))
+        {
             return Verdict::Allow;
         }
-        if !cfg.ip_blacklist.is_empty() && ip_in_list(ip, &cfg.ip_blacklist.join(",")) {
+        if !cfg.ip_blacklist.is_empty()
+            && cfg.ip_blacklist.iter().any(|rule| ip_match(ip, rule))
+        {
             return self.blocked(
                 &cfg,
                 403,
@@ -542,14 +591,15 @@ impl Waf {
             );
         }
 
-        let ua_lower = req.user_agent.trim().to_ascii_lowercase();
+        // 不把 UA 整体小写化（那会给每个请求分配一个 String）：用不区分大小的子串匹配
+        let ua_trim = req.user_agent.trim();
 
         // —— 自定义 UA 规则 ——
         if !cfg.extra_block_bots.is_empty()
             && cfg
                 .extra_block_bots
                 .iter()
-                .any(|k| ua_lower.contains(&k.to_ascii_lowercase()))
+                .any(|k| dhrust::text::contains_ignore_ascii_case(ua_trim, k.trim()))
         {
             return self.blocked(
                 &cfg,
@@ -559,7 +609,7 @@ impl Waf {
                 crate::stats::BlockKind::CustomRule,
             );
         }
-        if cfg.block_empty_ua && ua_lower.is_empty() {
+        if cfg.block_empty_ua && ua_trim.is_empty() {
             return self.blocked(
                 &cfg,
                 403,
@@ -573,7 +623,7 @@ impl Waf {
             && cfg
                 .extra_allow_bots
                 .iter()
-                .any(|k| ua_lower.contains(&k.to_ascii_lowercase()));
+                .any(|k| dhrust::text::contains_ignore_ascii_case(ua_trim, k.trim()));
         let sensitive = !cfg.sensitive_prefixes.is_empty()
             && cfg
                 .sensitive_prefixes
@@ -597,7 +647,7 @@ impl Waf {
         let mut friendly_bot = false;
         if !extra_allowed
             && !skip_bot
-            && let Some(kind) = bots::classify(&req.user_agent)
+            && let Some(kind) = bots::classify_cached(&req.user_agent)
         {
             match kind {
                 BotKind::Malicious => {
@@ -1379,7 +1429,7 @@ mod tests {
         let mut req = hreq("GET", vec![("X-Forwarded-For", "6.6.6.6")]);
         assert_eq!(waf.check_http(&req).blocked_status(), None);
 
-        // 开信任 + 对端回环 → 采用 XFF 首段，命中黑名单
+        // 开信任 + 对端回环 → 采用 XFF，命中黑名单
         waf.set_trust_forwarded_for(true);
         assert!(waf.trust_forwarded_for());
         assert_eq!(waf.check_http(&req).blocked_status(), Some(403));
@@ -1387,6 +1437,44 @@ mod tests {
         // 对端不是回环 → 忽略 XFF（防伪造）
         req.remote_addr = Some("10.1.2.3:5000".to_string());
         assert_eq!(waf.check_http(&req).blocked_status(), None);
+    }
+
+    /// 多段 `X-Forwarded-For` 必须取**末段**（离我们最近的那一跳），取首段等于允许伪造。
+    ///
+    /// 场景：客户端自带 `X-Forwarded-For: 1.2.3.4`，反代用追加语义写成本机真实 IP
+    /// → 头里变成 `1.2.3.4, 6.6.6.6`。取首段会看到 1.2.3.4（可伪造，绕过黑名单），
+    /// 取末段才是真实来源 6.6.6.6。
+    #[test]
+    fn forwarded_for_uses_last_segment() {
+        let mut cfg = WafConfig::admin_api();
+        cfg.loopback_bypass = false;
+        cfg.rate_limit_per_min = 0;
+        cfg.ip_blacklist = vec!["6.6.6.6".to_string()];
+        let waf = Waf::new(cfg);
+        waf.set_trust_forwarded_for(true);
+
+        // 伪造首段 + 真实末段在黑名单 → 必须拦
+        let req = hreq(
+            "GET",
+            vec![("X-Forwarded-For", "1.2.3.4, 6.6.6.6")],
+        );
+        assert_eq!(waf.check_http(&req).blocked_status(), Some(403));
+
+        // 反过来：真实末段不在黑名单、伪造首段在黑名单 → 不能误拦
+        let mut cfg2 = WafConfig::admin_api();
+        cfg2.loopback_bypass = false;
+        cfg2.rate_limit_per_min = 0;
+        cfg2.ip_blacklist = vec!["1.2.3.4".to_string()];
+        let waf2 = Waf::new(cfg2);
+        waf2.set_trust_forwarded_for(true);
+        assert_eq!(
+            waf2.check_http(&hreq(
+                "GET",
+                vec![("X-Forwarded-For", "1.2.3.4, 10.9.9.9")]
+            ))
+            .blocked_status(),
+            None
+        );
     }
 
     #[test]
@@ -1522,14 +1610,17 @@ mod tests {
         use std::hint::black_box;
         use std::time::Instant;
 
-        let waf = Waf::new(WafConfig::admin_api());
+        let mut cfg = WafConfig::admin_api();
+        cfg.rate_limit_per_min = 0; // 关掉 CC 限流：基准只看规则链，不要被 429 带到拦截分支
+        let waf = Waf::new(cfg);
         const N: usize = 200_000;
 
+        let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0";
         let make = || WafRequest {
             path: "/v1/chat/completions".to_string(),
             method: "POST".to_string(),
             query: "stream=true".to_string(),
-            user_agent: "curl/8.4.0".to_string(),
+            user_agent: ua.to_string(),
             remote_ip: "203.0.113.7".to_string(),
             content_type: "application/json".to_string(),
             body_text: String::new(),
@@ -1551,13 +1642,34 @@ mod tests {
                 "/v1/chat/completions",
                 "POST",
                 "stream=true",
-                "curl/8.4.0",
+                ua,
                 "203.0.113.7:51234",
                 "application/json",
             );
             black_box(waf.check_head(&req));
         }
         let reused_ns = started.elapsed().as_nanos() as f64 / N as f64;
+
+        // C：`check_head_http` 端到端（HTTP 早拒钩子实际调用的就是这个）——
+        //    含可信签名判定、XFF 解析、CSRF 校验、完整规则链；视图由 thread_local 复用
+        let head = dhrust::net::http::HttpRequestHead {
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            query: "stream=true".to_string(),
+            headers: vec![
+                ("User-Agent".to_string(), "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0".to_string()),
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("Host".to_string(), "api.example.com".to_string()),
+            ],
+            remote_addr: Some("203.0.113.7:51234".to_string()),
+            content_length: Some(64),
+        };
+        let started = Instant::now();
+        for _ in 0..N {
+            black_box(waf.check_head_http(&head));
+        }
+        let head_http_ns = started.elapsed().as_nanos() as f64 / N as f64;
+        println!("check_head_http 端到端（视图复用）：{head_http_ns:.0} ns/次");
 
         println!(
             "check_head：新建 {owned_ns:.0} ns/次；复用 {reused_ns:.0} ns/次；差 {:.0} ns（省 {:.1}%）",

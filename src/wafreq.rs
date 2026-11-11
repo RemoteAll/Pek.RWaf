@@ -22,42 +22,46 @@ pub struct WafRequest {
 }
 
 impl WafRequest {
-    /// 从 dhrust 请求构建。
-    pub fn from_http(req: &HttpRequest) -> Self {
-        let user_agent = req.header("user-agent").unwrap_or("").to_string();
-        let content_type = req.header("content-type").unwrap_or("").to_string();
-        let body_text = if is_text_content_type(&content_type) {
+    /// 用 dhrust 请求**覆写**自身（复用已有容量，首次之后零分配）。
+    ///
+    /// 与旧版 `from_http()` 的差别：不再 `clone()` 路径/查询串、不再为每个字段新建 `String`。
+    /// **旧的所有权构造已删除**（用户 2026-11-11：「不要留这种，要不然永远都不会使用最新的」）——
+    /// 一律用「持有实例 + 覆写」的形态，从 API 层面就避免在热路径上分配。
+    pub fn fill_from_http(&mut self, req: &HttpRequest) {
+        self.clear();
+        self.path.push_str(&req.path);
+        self.method.push_str(&req.method);
+        self.query.push_str(&req.query);
+        self.user_agent
+            .push_str(req.header("user-agent").unwrap_or(""));
+        strip_port_into(req.remote_addr.as_deref().unwrap_or(""), &mut self.remote_ip);
+        self.content_type
+            .push_str(req.header("content-type").unwrap_or(""));
+        // body 预览：只在文本类时抽取（≤ 16KB，二进制不看）
+        if is_text_content_type(&self.content_type) {
             let cap = req.body.len().min(16 * 1024);
-            String::from_utf8_lossy(&req.body[..cap]).to_string()
-        } else {
-            String::new()
-        };
-        Self {
-            path: req.path.clone(),
-            method: req.method.clone(),
-            query: req.query.clone(),
-            user_agent,
-            remote_ip: strip_port(req.remote_addr.as_deref().unwrap_or("")),
-            content_type,
-            body_text,
+            match std::str::from_utf8(&req.body[..cap]) {
+                Ok(text) => self.body_text.push_str(text),
+                Err(_) => self
+                    .body_text
+                    .push_str(&String::from_utf8_lossy(&req.body[..cap])),
+            }
         }
     }
 
-    /// 从 **请求头快照** 构建（还没读 body 时）。
+    /// 用 **请求头快照**覆写自身（还没读 body 时；`body_text` 恒为空）。
     ///
-    /// 与 [`from_http`] 的差别只有 `body_text` 恒为空——因为此刻 body 还没收到。
     /// 用于 HTTP 层的早拒钩子：UA / IP / 路径 / 查询串命中特征即可拒绝，
     /// **不让对方把大 body 传上来**（省带宽）。body 级规则由之后的 [`Waf::check`](crate::Waf::check) 补齐。
-    pub fn from_head(head: &HttpRequestHead) -> Self {
-        Self {
-            path: head.path.clone(),
-            method: head.method.clone(),
-            query: head.query.clone(),
-            user_agent: head.header("user-agent").unwrap_or("").to_string(),
-            remote_ip: strip_port(head.remote_addr.as_deref().unwrap_or("")),
-            content_type: head.header("content-type").unwrap_or("").to_string(),
-            body_text: String::new(),
-        }
+    pub fn fill_from_head(&mut self, head: &HttpRequestHead) {
+        self.fill_head(
+            &head.path,
+            &head.method,
+            &head.query,
+            head.header("user-agent").unwrap_or(""),
+            head.remote_addr.as_deref().unwrap_or(""),
+            head.header("content-type").unwrap_or(""),
+        );
     }
 
     /// 供规则引擎读取的成员值（对齐 C# `WebRequest` 常用属性；未知成员返回空串）。
@@ -91,9 +95,9 @@ impl WafRequest {
         self.body_text.clear();
     }
 
-    /// 用**请求头**字段覆写自身（复用已有容量；语义与 [`WafRequest::from_head`] 一致，只是不新建对象）。
+    /// 用**请求头**字段覆写自身（复用已有容量）。
     ///
-    /// 与 `from_head` 的差别：不再为每个字段分配新 `String`，而是在已分配的缓冲上 `push_str`。
+    /// 不再为每个字段分配新 `String`，而是在已分配的缓冲上 `push_str`。
     pub fn fill_head(
         &mut self,
         path: &str,
@@ -291,10 +295,16 @@ mod tests {
             body: bytes::Bytes::new(),
             remote_addr: Some("127.0.0.1:9999".to_string()),
         };
-        let wr = WafRequest::from_http(&req);
+        let mut wr = WafRequest::default();
+        wr.fill_from_http(&req);
         assert_eq!(wr.remote_ip, "127.0.0.1");
         assert_eq!(wr.user_agent, "curl/8.0");
         assert_eq!(wr.member("Path"), "/api/test");
         assert_eq!(wr.member("RemoteIp"), "127.0.0.1");
+
+        // 复用同一实例覆写：不能残留上一次的字段（body 尤其容易漏）
+        wr.fill_from_http(&req);
+        assert_eq!(wr.path, "/api/test");
+        assert_eq!(wr.body_text, "");
     }
 }
