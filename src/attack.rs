@@ -129,62 +129,15 @@ pub const CMD_PATTERNS: &[&str] = &[
 
 /// URL 百分号解码（`+` 视作空格；非法序列保留原样；UTF-8 边界安全）。
 ///
-/// 优化：不含 `%`/`+` 时直接返回原串（最常见）；否则解码到 `Vec<u8>` 后
-/// `String::from_utf8` **直接接管缓冲**（合法 UTF-8 时零额外分配）。
+/// **已下沉到公共库** [`dhrust::web::form_decode`]（语义完全相同：表单解码 = `+` 变空格）。
+/// 本函数保留为薄封装，避免调用点散落 `dhrust::web::`。
 pub fn percent_decode(input: &str) -> String {
-    if !input.as_bytes().iter().any(|b| *b == b'%' || *b == b'+') {
-        return input.to_string();
-    }
-    let mut out: Vec<u8> = Vec::with_capacity(input.len());
-    decode_bytes_into(input.as_bytes(), &mut out);
-    match String::from_utf8(out) {
-        Ok(s) => s,
-        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-    }
-}
-
-/// 按字节解码百分号编码（非法序列原样保留），结果追加到 `out`。
-///
-/// 内部复用：`normalize` 系列一次解码到底，省掉「先建 String 再拷一次」。
-fn decode_bytes_into(input: &[u8], out: &mut Vec<u8>) {
-    let mut i = 0;
-    while i < input.len() {
-        match input[i] {
-            b'%' if i + 2 < input.len() => {
-                let hi = hex_val(input[i + 1]);
-                let lo = hex_val(input[i + 2]);
-                if let (Some(h), Some(l)) = (hi, lo) {
-                    out.push((h << 4) | l);
-                    i += 3;
-                    continue;
-                }
-                out.push(input[i]);
-                i += 1;
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
+    dhrust::web::form_decode(input)
 }
 
 /// 规范化：解码（两次，覆盖双重编码）+ 小写 + 空白折叠。
 ///
-/// 优化：解码一次后已不含 `%` 时**不再做第二次解码**（正常请求省一次分配与拷贝）。
+/// 快路径：解码一次后已不含 `%` 时**不再做第二次解码**（正常请求省一次分配与拷贝）。
 pub fn normalize(text: &str) -> String {
     normalize_parts(&[text])
 }
@@ -192,75 +145,30 @@ pub fn normalize(text: &str) -> String {
 /// 多段文本规范化（**零拼接分配**）：各段按顺序视为直接相连（分隔符由调用方作为独立段给出），
 /// 语义与 `normalize(&format!("{a}{b}{c}"))` 完全一致，但不再为拼接多分配一个 String。
 ///
-/// 快路径（绝大多数请求）：全文不含 `%` → 只做一趟「`+`/空白折叠 + 小写」直接产出结果；
-/// 慢路径（含 `%`）：先解码到字节缓冲，仍需二次解码时追加「解码一次 + 空格 + 解码两次」，
-/// 与旧实现 `"{once} {twice}"` 等价。
+/// - **完全无转义**（不含 `%`/`+`，绝大多数请求）：直接交给
+///   [`dhrust::text::normalize_lower_parts`] 做一趟「折叠空白 + 小写」，零中间缓冲；
+/// - **含转义**：用 [`dhrust::web::percent_decode_into`] 解码到字节缓冲（WAF 特有的
+///   「双重编码再解一次」也在这里），再交给同一函数出结果。
 pub fn normalize_parts(parts: &[&str]) -> String {
-    let capacity = parts.iter().map(|p| p.len()).sum();
-    if !parts.iter().any(|p| p.contains('%')) {
-        return collapse_lower(parts.iter().copied(), capacity);
+    // 用 `str::contains(char)`（memchr 加速）而不是手写字节循环：
+    // 16 KB 正文上手写循环约 10 µs，memchr 只要 1 µs 量级。
+    let needs_decode = parts.iter().any(|p| p.contains('%') || p.contains('+'));
+    if !needs_decode {
+        return dhrust::text::normalize_lower_parts(parts);
     }
-    let mut raw: Vec<u8> = Vec::with_capacity(capacity);
+    let mut raw: Vec<u8> = Vec::with_capacity(parts.iter().map(|p| p.len()).sum());
     for p in parts {
-        decode_bytes_into(p.as_bytes(), &mut raw);
+        dhrust::web::percent_decode_into(p.as_bytes(), &mut raw, true);
     }
     if raw.contains(&b'%') {
         // 覆盖双重编码：保留「解一次」形态，再追加「解两次」形态
         let mut twice: Vec<u8> = Vec::with_capacity(raw.len() + 1);
-        decode_bytes_into(&raw, &mut twice);
+        dhrust::web::percent_decode_into(&raw, &mut twice, true);
         raw.push(b' ');
         raw.extend_from_slice(&twice);
     }
     let text = String::from_utf8_lossy(&raw);
-    collapse_lower(std::iter::once(text.as_ref()), text.len())
-}
-
-/// 把多段文本「折叠空白 + 小写」直接写进结果串（各段之间不额外插空格）。
-///
-/// 两个要点（都是实测出来的）：
-/// 1. **必须预分配 `capacity`** —— 否则长 body 会因 `String` 反复扩容重拷，比旧实现还慢；
-/// 2. 全 ASCII 时走**字节**快路径（不逐 `char` 解码再编码），中文等非 ASCII 才回落字符路径。
-///
-/// 入参要求 `Clone` 是为了「先判是否纯 ASCII、再正式跑一遍」两趟遍历**不额外分配**。
-fn collapse_lower<'a, I>(parts: I, capacity: usize) -> String
-where
-    I: Iterator<Item = &'a str> + Clone,
-{
-    if parts.clone().all(|s| s.is_ascii()) {
-        let mut out: Vec<u8> = Vec::with_capacity(capacity);
-        let mut last_space = true; // 起始不加多余空格
-        for seg in parts {
-            for &b in seg.as_bytes() {
-                // `+` 与百分号解码里的「`+` → 空格」保持同口径
-                if b == b'+' || b.is_ascii_whitespace() {
-                    if !last_space {
-                        out.push(b' ');
-                        last_space = true;
-                    }
-                } else {
-                    out.push(b.to_ascii_lowercase());
-                    last_space = false;
-                }
-            }
-        }
-        return String::from_utf8(out).expect("纯 ASCII 缓冲必定是合法 UTF-8");
-    }
-    let mut out = String::with_capacity(capacity);
-    let mut last_space = true;
-    for seg in parts {
-        for c in seg.chars() {
-            if c == '+' || c.is_whitespace() {
-                if !last_space {
-                    out.push(' ');
-                    last_space = true;
-                }
-            } else {
-                out.push(c.to_ascii_lowercase());
-                last_space = false;
-            }
-        }
-    }
-    out
+    dhrust::text::normalize_lower(&text)
 }
 
 fn hit(text: &str, patterns: &[&str]) -> bool {

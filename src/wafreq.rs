@@ -48,20 +48,16 @@ impl WafRequest {
     /// 填写 body 预览（只取前 `limit` 字节）。
     ///
     /// 与 [`fill_from_http`](Self::fill_from_http) 拆开是为了「不扫 body 就不复制」：
-    /// 合法 UTF-8 时直接借校验通过的切片写进复用缓冲（容量保留）。
-    /// 「是不是文本类」由调用方判断（配置 `body_scan_all_types` 会改变结论）。
+    /// 合法 UTF-8 时直接借校验通过的切片写进复用缓冲（容量保留）——取前缀这一步走
+    /// [`dhrust::text::utf8_lossy_prefix`]（合法时零拷贝，坏字节才 lossy，不会因
+    /// 二进制 payload 整段跳过）。「是不是文本类」由调用方判断（`body_scan_all_types` 会改变结论）。
     pub fn fill_body_preview(&mut self, body: &[u8], limit: usize) {
         self.body_text.clear();
         if body.is_empty() || limit == 0 {
             return;
         }
-        let cap = body.len().min(limit);
-        match std::str::from_utf8(&body[..cap]) {
-            Ok(text) => self.body_text.push_str(text),
-            Err(_) => self
-                .body_text
-                .push_str(&String::from_utf8_lossy(&body[..cap])),
-        }
+        self.body_text
+            .push_str(dhrust::text::utf8_lossy_prefix(body, limit).as_ref());
     }
 
     /// 用 **请求头快照**覆写自身（还没读 body 时；`body_text` 恒为空）。
@@ -143,41 +139,18 @@ pub fn is_text_content_type(content_type: &str) -> bool {
 }
 
 /// 剥离 `IP:Port` 中的端口（兼容 `[::1]:123` 形态；无端口原样返回）。
+///
+/// **已下沉到公共库** [`dhrust::net::strip_port`]（零分配返回切片），本函数保留为
+/// 「返回 String」的薄封装供旧调用点使用。
 pub fn strip_port(addr: &str) -> String {
-    // 返回「去掉端口的那个切片」/「整体」，由 `strip_port_into` 统一实现
-    let (host, _) = strip_port_parts(addr);
-    host.to_string()
+    dhrust::net::strip_port(addr).to_string()
 }
 
 /// 剥离端口并**追加**到已有缓冲（不额外分配）。
 ///
 /// 热路径用：`WafRequest::fill_head` 复用实例时靠它把 `IP:Port` 写进已有容量。
 pub fn strip_port_into(addr: &str, out: &mut String) {
-    let (host, _) = strip_port_parts(addr);
-    out.push_str(host);
-}
-
-/// 拆出（去掉端口的 host 切片, 原串），供 `strip_port` / `strip_port_into` 共用。
-fn strip_port_parts(addr: &str) -> (&str, ()) {
-    let addr = addr.trim();
-    if addr.is_empty() {
-        return ("", ());
-    }
-    if let Some(rest) = addr.strip_prefix('[') {
-        // [v6]:port 或 [v6]
-        if let Some((host, _)) = rest.split_once(']') {
-            return (host, ());
-        }
-        return (addr, ());
-    }
-    // v4:port（恰一个冒号）——多个冒号视为裸 IPv6
-    if addr.matches(':').count() == 1
-        && let Some((host, port)) = addr.rsplit_once(':')
-        && port.chars().all(|c| c.is_ascii_digit())
-    {
-        return (host, ());
-    }
-    (addr, ())
+    dhrust::net::strip_port_into(addr, out);
 }
 
 /// 判断 IP 是否命中单条规则（精确 / CIDR（v4）/ 通配符（v4 分段））。
