@@ -27,6 +27,12 @@ impl WafRequest {
     /// 与旧版 `from_http()` 的差别：不再 `clone()` 路径/查询串、不再为每个字段新建 `String`。
     /// **旧的所有权构造已删除**（用户 2026-11-11：「不要留这种，要不然永远都不会使用最新的」）——
     /// 一律用「持有实例 + 覆写」的形态，从 API 层面就避免在热路径上分配。
+    ///
+    /// **不填 `body_text`**（这是故意的，不是遗漏）：
+    /// ① 命中 `skip_attack_prefixes` 的请求（聊天/API 接口）根本不扫 body，
+    ///    白拷一份 16 KB 实测要 ~24 µs（复制 + UTF-8 校验，且在中间件里被拷了两遍）；
+    /// ② 扫描上限来自配置（`body_scan_limit`），不该由视图自己拍。
+    /// 需要 body 时由调用方调 [`fill_body_preview`](Self::fill_body_preview)。
     pub fn fill_from_http(&mut self, req: &HttpRequest) {
         self.clear();
         self.path.push_str(&req.path);
@@ -37,15 +43,24 @@ impl WafRequest {
         strip_port_into(req.remote_addr.as_deref().unwrap_or(""), &mut self.remote_ip);
         self.content_type
             .push_str(req.header("content-type").unwrap_or(""));
-        // body 预览：只在文本类时抽取（≤ 16KB，二进制不看）
-        if is_text_content_type(&self.content_type) {
-            let cap = req.body.len().min(16 * 1024);
-            match std::str::from_utf8(&req.body[..cap]) {
-                Ok(text) => self.body_text.push_str(text),
-                Err(_) => self
-                    .body_text
-                    .push_str(&String::from_utf8_lossy(&req.body[..cap])),
-            }
+    }
+
+    /// 填写 body 预览（只取前 `limit` 字节）。
+    ///
+    /// 与 [`fill_from_http`](Self::fill_from_http) 拆开是为了「不扫 body 就不复制」：
+    /// 合法 UTF-8 时直接借校验通过的切片写进复用缓冲（容量保留）。
+    /// 「是不是文本类」由调用方判断（配置 `body_scan_all_types` 会改变结论）。
+    pub fn fill_body_preview(&mut self, body: &[u8], limit: usize) {
+        self.body_text.clear();
+        if body.is_empty() || limit == 0 {
+            return;
+        }
+        let cap = body.len().min(limit);
+        match std::str::from_utf8(&body[..cap]) {
+            Ok(text) => self.body_text.push_str(text),
+            Err(_) => self
+                .body_text
+                .push_str(&String::from_utf8_lossy(&body[..cap])),
         }
     }
 
@@ -305,6 +320,35 @@ mod tests {
         // 复用同一实例覆写：不能残留上一次的字段（body 尤其容易漏）
         wr.fill_from_http(&req);
         assert_eq!(wr.path, "/api/test");
+        assert_eq!(wr.body_text, "");
+    }
+
+    /// body 预览是**单独一步**（`fill_from_http` 故意不填）：
+    /// 这样「不扫 body 的请求」根本不会白拷一份大正文。
+    #[test]
+    fn fill_body_preview_is_opt_in_and_clears() {
+        let req = dhrust::net::http::HttpRequest {
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            query: String::new(),
+            headers: vec![(
+                "Content-Type".to_string(),
+                "application/json".to_string(),
+            )],
+            body: bytes::Bytes::from_static(b"{\"q\":\"1' or 1=1--\"}"),
+            remote_addr: Some("127.0.0.1:9999".to_string()),
+        };
+        let mut wr = WafRequest::default();
+        wr.fill_from_http(&req);
+        assert_eq!(wr.body_text, "", "fill_from_http 不再复制 body");
+
+        wr.fill_body_preview(&req.body, 1024);
+        assert_eq!(wr.body_text, "{\"q\":\"1' or 1=1--\"}");
+
+        // 上限生效 + 再次填充分明先清空（不残留上一次的长 body）
+        wr.fill_body_preview(&req.body, 4);
+        assert_eq!(wr.body_text, "{\"q\"");
+        wr.fill_body_preview(&[], 1024);
         assert_eq!(wr.body_text, "");
     }
 }

@@ -474,15 +474,12 @@ impl Waf {
         // 复用每线程视图：只做 `push_str` 覆写，不再为每个请求新建 6~7 个 String
         with_scratch(|wreq| {
             wreq.fill_from_http(req);
-            let is_text = crate::wafreq::is_text_content_type(&wreq.content_type);
-            if !req.body.is_empty() && (all_types || is_text) {
-                let cap = req.body.len().min(limit);
-                wreq.body_text.clear();
-                match std::str::from_utf8(&req.body[..cap]) {
-                    Ok(text) => wreq.body_text.push_str(text),
-                    Err(_) => wreq
-                        .body_text
-                        .push_str(&String::from_utf8_lossy(&req.body[..cap])),
+            // **只在真要扫 body 时**才复制预览：命中 `skip_attack_prefixes` 的请求
+            //（聊天/API 接口）根本不看 body，实测 16 KB body 白拷一份要 ~24 µs。
+            if !self.skips_attack(&req.path) {
+                let is_text = crate::wafreq::is_text_content_type(&wreq.content_type);
+                if all_types || is_text {
+                    wreq.fill_body_preview(&req.body, limit);
                 }
             }
             wreq.remote_ip.clear();
@@ -496,6 +493,30 @@ impl Waf {
             }
             self.check(wreq)
         })
+    }
+
+    /// 该路径是否**跳过攻击特征扫描**（配置前缀 + 内存态强制豁免）。
+    ///
+    /// 单一判定来源：[`check_inner`](Self::check_inner) 用它决定扫不扫，
+    /// [`check_http`](Self::check_http) 用它决定要不要复制 body 预览。
+    /// 锁中毒时返回 `false`（= 照扫），是**失败朝安全**的方向。
+    fn skips_attack(&self, path: &str) -> bool {
+        let from_cfg = self
+            .config
+            .read()
+            .map(|c| {
+                !c.skip_attack_prefixes.is_empty()
+                    && c.skip_attack_prefixes
+                        .iter()
+                        .any(|p| path.starts_with(p.as_str()))
+            })
+            .unwrap_or(false);
+        from_cfg
+            || self
+                .forced_skip_attack
+                .read()
+                .map(|v| v.iter().any(|p| path.starts_with(p.as_str())))
+                .unwrap_or(false)
     }
 
     /// 对规范化请求执行检查。
@@ -721,17 +742,9 @@ impl Waf {
         }
 
         // —— 攻击特征（skipAttackPrefixes 下的管理端点跳过——如在线 SQL/文件管理，由业务层护栏负责）——
-        let skip_attack = (!cfg.skip_attack_prefixes.is_empty()
-            && cfg
-                .skip_attack_prefixes
-                .iter()
-                .any(|p| req.path.starts_with(p.as_str())))
-            || self
-                .forced_skip_attack
-                .read()
-                .map(|v| v.iter().any(|p| req.path.starts_with(p.as_str())))
-                .unwrap_or(false);
-        if !skip_attack {
+        // 与 `check_http` 共用 `skips_attack`：那边决定「不复制 body」，这边决定「不扫描」，
+        // 两处必须同一个判据，否则会出现「复制了不扫」或「扫了个空 body」。
+        if !self.skips_attack(&req.path) {
             // 静态资源（js/css/图片/字体）只做「路径穿越 / 敏感路径」检测：
             // 这些文件内容天然含 `' or `、`<script` 之类片段，跑全量特征是误报高发区，
             // 且面板每次加载都要重复扫 N 个文件——省掉这部分每请求的字符串分配。
@@ -1549,6 +1562,40 @@ mod tests {
         assert!(waf.check_http(&req).is_allow());
     }
 
+    /// 文本类 body 注入必须被拦（守住 `fill_body_preview` 这条新路径），
+    /// 且**豁免前缀下不扫**（那部分由业务层护栏负责）。
+    ///
+    /// 这条用例是为「body 复制拆出 `check_http`」的改动配的：一旦有人在
+    /// `check_http` 里漏掉 body 填充，这里会立刻变红。
+    #[test]
+    fn text_body_scanned_unless_prefix_skipped() {
+        let mut cfg = WafConfig::admin_api();
+        cfg.loopback_bypass = false;
+        cfg.rate_limit_per_min = 0;
+        let waf = Waf::new(cfg);
+
+        let mut req = hreq("POST", vec![("Content-Type", "application/json")]);
+        req.path = "/panel/save".to_string();
+        req.body = bytes::Bytes::from_static(b"{\"q\":\"1' or 1=1--\"}");
+        assert_eq!(
+            waf.check_http(&req).blocked_status(),
+            Some(403),
+            "文本 body 注入必须拦"
+        );
+
+        // 正常中文 body 不误伤
+        req.body = bytes::Bytes::from("{\"alias\":\"招商银行经典白金卡\"}".as_bytes().to_vec());
+        assert!(waf.check_http(&req).is_allow(), "正常中文 body 不应误报");
+
+        // 豁免前缀：同一个注入 body 不再扫（该前缀由业务层护栏负责）
+        let mut cfg = waf.config();
+        cfg.skip_attack_prefixes = vec!["/v1".to_string()];
+        waf.apply_config(cfg).unwrap();
+        req.path = "/v1/chat/completions".to_string();
+        req.body = bytes::Bytes::from_static(b"{\"q\":\"1' or 1=1--\"}");
+        assert!(waf.check_http(&req).is_allow(), "豁免前缀不扫 body");
+    }
+
     /// 头阶段检查也要认可信签名（否则已签名业务请求会被 UA 规则早拒）。
     #[test]
     fn head_stage_respects_trusted_signature_and_csrf() {
@@ -1679,5 +1726,88 @@ mod tests {
         // 复用版必须与新建版语义一致（端口被剥掉、路径不变）
         assert_eq!(req.remote_ip, "203.0.113.7");
         assert_eq!(req.path, "/v1/chat/completions");
+    }
+
+    /// 基准：**100 万请求**的 WAF 总 CPU 占用（回答「量大了这块会不会很吃资源」）。
+    ///
+    /// 手动跑：`cargo test --release --lib bench_million_requests_cpu -- --ignored --nocapture`
+    ///
+    /// 按 Pek.Proxy 实际配置建模（`security::build`）：`skip_attack_prefixes=/v1,/api`、
+    /// `csrf_guard=false`、`rate_limit_per_min=0`、`loopback_bypass=false`。
+    /// 每请求 = 头部早拒（`check_head_http`）+ 完整检查（`check_http`，带 body）。
+    #[test]
+    #[ignore = "bench（手动运行）"]
+    fn bench_million_requests_cpu() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const N: usize = 20_000;
+        let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0";
+        let unit = "{\"role\":\"user\",\"content\":\"请帮我总结这份招标文件里的技术要求与评分办法，注意工期和质保条款。\"},";
+        let mut real_16k = String::from("{\"messages\":[");
+        while real_16k.len() < 16 * 1024 {
+            real_16k.push_str(unit);
+        }
+        real_16k.push_str("]}");
+
+        let mut cfg = WafConfig::admin_api();
+        cfg.loopback_bypass = false;
+        cfg.rate_limit_per_min = 0;
+        cfg.csrf_guard = false;
+        // 与 Pek.Proxy 一致：机器接口豁免 bot 规则；/v1、/api 跳过攻击特征扫描
+        cfg.skip_bot_prefixes = vec!["/v1".into(), "/api".into()];
+        cfg.skip_attack_prefixes = vec!["/v1".into(), "/api".into()];
+        let waf = Waf::new(cfg);
+
+        let make_head = |path: &str, len: usize| dhrust::net::http::HttpRequestHead {
+            method: "POST".to_string(),
+            path: path.to_string(),
+            query: String::new(),
+            headers: vec![
+                ("User-Agent".to_string(), ua.to_string()),
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("Host".to_string(), "api.example.com".to_string()),
+            ],
+            remote_addr: Some("203.0.113.7:51234".to_string()),
+            content_length: Some(len as u64),
+        };
+        let make_req = |path: &str, body: &str| dhrust::net::http::HttpRequest {
+            method: "POST".to_string(),
+            path: path.to_string(),
+            query: String::new(),
+            headers: vec![
+                ("User-Agent".to_string(), ua.to_string()),
+                ("Content-Type".to_string(), "application/json".to_string()),
+            ],
+            body: bytes::Bytes::from(body.to_string()),
+            remote_addr: Some("203.0.113.7:51234".to_string()),
+        };
+
+        // 三种真实形态：聊天接口（不扫 body）/ 面板 16KB 表单（全量扫描）/ 面板小请求
+        let cases: [(&str, &str, &str); 3] = [
+            ("聊天 /v1/chat/completions（16KB body，跳过特征扫描）", "/v1/chat/completions", &real_16k),
+            ("面板 /panel（16KB body，全量扫描）", "/panel", &real_16k),
+            ("面板 /panel（小 body）", "/panel", "{\"alias\":\"我的卡\"}"),
+        ];
+
+        for (label, path, body) in cases {
+            let head = make_head(path, body.len());
+            let req = make_req(path, body);
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let started = Instant::now();
+                for _ in 0..N {
+                    black_box(waf.check_head_http(&head)); // 早拒（每请求都跑）
+                    black_box(waf.check_http(&req)); // 完整检查（含 body）
+                }
+                best = best.min(started.elapsed().as_nanos() as f64 / N as f64);
+            }
+            let ms_1m = best * 1_000_000.0 / 1e9 * 1000.0;
+            println!(
+                "{label}\n    {best:>9.0} ns/请求  → 100 万请求共 {:.1} ms CPU（{:.2} 核·秒）",
+                ms_1m,
+                ms_1m / 1000.0
+            );
+        }
     }
 }
