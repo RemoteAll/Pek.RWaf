@@ -1509,4 +1509,63 @@ mod tests {
         let cross = head(vec![("Sec-Fetch-Site", "cross-site")]);
         assert_eq!(waf.check_head_http(&cross).blocked_status(), Some(403));
     }
+
+    /// 基准：`check_head` 端到端，对比「每请求新建 WafRequest」 vs 「复用 + fill_head」
+    ///
+    /// 手动跑：`cargo test --release --lib bench_head_check_owned_vs_reused -- --ignored --nocapture`
+    ///
+    /// 目的：回答「省掉 6 个 String 分配，对一次真实的头部检查到底占多少」——
+    /// 只测分配（~150 ns）容易高估，要放进 `check_head` 里看占比。
+    #[test]
+    #[ignore = "bench（手动运行）"]
+    fn bench_head_check_owned_vs_reused() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let waf = Waf::new(WafConfig::admin_api());
+        const N: usize = 200_000;
+
+        let make = || WafRequest {
+            path: "/v1/chat/completions".to_string(),
+            method: "POST".to_string(),
+            query: "stream=true".to_string(),
+            user_agent: "curl/8.4.0".to_string(),
+            remote_ip: "203.0.113.7".to_string(),
+            content_type: "application/json".to_string(),
+            body_text: String::new(),
+        };
+
+        // A：每请求新建（6 个 String 分配）
+        let started = Instant::now();
+        for _ in 0..N {
+            let req = make();
+            black_box(waf.check_head(&req));
+        }
+        let owned_ns = started.elapsed().as_nanos() as f64 / N as f64;
+
+        // B：复用同一个实例，fill_head 覆写（首次之后零分配）
+        let mut req = make();
+        let started = Instant::now();
+        for _ in 0..N {
+            req.fill_head(
+                "/v1/chat/completions",
+                "POST",
+                "stream=true",
+                "curl/8.4.0",
+                "203.0.113.7:51234",
+                "application/json",
+            );
+            black_box(waf.check_head(&req));
+        }
+        let reused_ns = started.elapsed().as_nanos() as f64 / N as f64;
+
+        println!(
+            "check_head：新建 {owned_ns:.0} ns/次；复用 {reused_ns:.0} ns/次；差 {:.0} ns（省 {:.1}%）",
+            owned_ns - reused_ns,
+            (owned_ns - reused_ns) / owned_ns * 100.0
+        );
+        // 复用版必须与新建版语义一致（端口被剥掉、路径不变）
+        assert_eq!(req.remote_ip, "203.0.113.7");
+        assert_eq!(req.path, "/v1/chat/completions");
+    }
 }
